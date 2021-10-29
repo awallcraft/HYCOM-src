@@ -26,6 +26,43 @@
 ! --- hybrid grid generator
 ! --- ---------------------
 !
+! From blkdat.input (units may have chnaged from m to pressure):
+!
+! --- 'nhybrd' = number of hybrid levels (0=all isopycnal)
+! --- 'nsigma' = number of sigma  levels (nhybrd-nsigma z-levels)
+! --- 'dp0k  ' = layer k deep    z-level spacing minimum thickness (m)
+! ---              k=1,kdm; dp0k must be zero for k>nhybrd
+! --- 'ds0k  ' = layer k shallow z-level spacing minimum thickness (m)
+! ---              k=1,nsigma
+! --- 'dp00i'  = deep iso-pycnal spacing minimum thickness (m)
+! --- 'isotop' = shallowest depth for isopycnal layers     (m)
+!                now in topiso(:,:)
+! --- 'sigma ' = isopycnal layer target densities (sigma units)
+! ---            now in theta(:,:,1:kdm)
+!
+! --- the above specifies a vertical coord. that is isopycnal or:
+! ---  near surface z in    deep water, based on dp0k
+! ---  near surface z in shallow water, based on ds0k and nsigma
+! ---   terrain-following between them, based on ds0k and nsigma
+!
+! --- terrain following starts at depth dpns=sum(dp0k(k),k=1,nsigma) and
+! --- ends at depth dsns=sum(ds0k(k),k=1,nsigma), and the depth of the
+! --- k-th layer interface varies linearly with total depth between
+! --- these two reference depths, i.e. a z-sigma-z fixed coordinate.
+!
+! --- near the surface (i.e. shallower than isotop), layers are always 
+! --- fixed depth (z or sigma).
+! --  layer 1 is always fixed, so isotop=0.0 is not allowed.
+! --- near surface layers can also be forced to be fixed depth
+! --- by setting target densities (sigma(k)) very small.
+!
+! --- away from the surface, the minimum layer thickness is dp00i.
+!
+! --- for fixed depth targets to be:
+! ---  z-only set nsigma=0,
+! ---  sigma-z (shallow-deep) use a very small ds0k(:),
+! ---  sigma-only set nsigma=kdm, dp0k large, and ds0k small.
+!
       logical, parameter :: lpipe_hybgen=.false.  !for debugging
 !
       integer   i,j,k
@@ -44,7 +81,7 @@
 !$OMP              SHARED(m,n) &
 !$OMP          SCHEDULE(STATIC,jblk)
       do j=1,jj
-        call hybgenaj(m,n, j)
+        call hybgenaj(n, j)
       enddo
 !$OMP END PARALLEL DO
 !
@@ -190,85 +227,117 @@
       return
       end subroutine hybgen
 
-      subroutine hybgenaj(m,n,j )
+      subroutine hybgenaj(n,j )
       use mod_xc         ! HYCOM communication interface
       use mod_cb_arrays  ! HYCOM saved arrays
       implicit none
 !
-      integer m,n, j
+      integer n, j   !n is current timestep
 !
 ! --- --------------------------------------------
 ! --- hybrid grid generator, single j-row (part A).
 ! --- --------------------------------------------
 !
-      logical, parameter :: lunmix=.true.     !unmix a too light deepest layer
-      logical, parameter :: lconserve=.false. !explicitly conserve each column
-      integer, parameter :: ndebug_tracer=0   !tracer to debug, usually 0 (off)
+      integer i,k
 !
-      double precision asum(  mxtrcr+4,3)
-      real             offset(mxtrcr+4)
+      integer fixlay            !deepest fixed coordinate layer
+      real    qdep              !fraction not terrain following
+      real    qhrlx( kdm+1),  & !relaxation coefficient
+              dp0ij( kdm),    & !minimum layer thickness
+              dp0cum(kdm+1)     !minimum interface depth
+      real    pres(kdm+1)       !original layer interfaces
 !
-      logical lcm(kdm)             !use PCM for some layers?
-      real    s1d(kdm,mxtrcr+4),    & !original scalar fields
-              f1d(kdm,mxtrcr+4),    & !final    scalar fields
-              c1d(kdm,mxtrcr+4,3),  & !interpolation coefficients
-              dpi( kdm),            & !original layer thicknesses, >= dpthin
-              dprs(kdm),            & !original layer thicknesses
-              pres(kdm+1),          & !original layer interfaces
-              prsf(kdm+1),          & !final    layer interfaces
-              qhrlx( kdm+1),        & !relaxation coefficient, from qhybrlx
-              dp0ij( kdm),          & !minimum layer thickness
-              dp0cum(kdm+1)        !minimum interface depth
-      real    p_hat,p_hat0,p_hat2,p_hat3,hybrlx, &
-              delt,deltm,dels,delsm,q,qdep,qtr,qts,thkbop, &
-              zthk,dpthin
-      integer i,k,ka,kp,ktr,fixall,fixlay,nums1d
-      character*12 cinfo
-!
-      double precision, parameter ::   zp5=0.5    !for sign function
-!
-! --- c u s h i o n   function (from Bleck & Benjamin, 1992):
-! --- if delp >= qqmx*dp0 >>  dp0, -cushn- returns -delp-
-! --- if delp <= qqmn*dp0 << -dp0, -cushn- returns  -dp0-
-!
-      real       qqmn,qqmx,cusha,cushb
-      parameter (qqmn=-4.0, qqmx=2.0)  ! shifted range
-!     parameter (qqmn=-2.0, qqmx=4.0)  ! traditional range
-!     parameter (qqmn=-4.0, qqmx=6.0)  ! somewhat wider range
-      parameter (cusha=qqmn**2*(qqmx-1.0)/(qqmx-qqmn)**2)
-      parameter (cushb=1.0/qqmn)
-!
-      real qq,cushn,delp,dp0
-# include "stmt_fns.h"
-      qq(   delp,dp0)=max(qqmn, min(qqmx, delp/dp0))
-      cushn(delp,dp0)=dp0* &
-                      (1.0+cusha*(1.0-cushb*qq(delp,dp0))**2)* &
-                      max(1.0, delp/(dp0*qqmx))
-!
-      dpthin = 0.001*onemm
-      thkbop = thkbot*onem
-      hybrlx = 1.0/qhybrlx
-!
-      if (mxlmy) then
-        nums1d = ntracr + 4
-      else
-        nums1d = ntracr + 2
-      endif
-!
-      if     (.not.isopcm) then
-! ---   lcm the same for all points
-        do k=1,nhybrd
-          lcm(k) = .false.  !use same remapper for all layers
-        enddo !k
-        do k=nhybrd+1,kk
-          lcm(k) = .true.   !purely isopycnal layers use PCM
-        enddo !k
-      endif
+      real    theta_i_j(kdm)    !theta(i,j,:)   target potential density
+      real     temp_i_j(kdm)    ! temp(i,j,:,n) potential temperature
+      real     saln_i_j(kdm)    ! saln(i,j,:,n) salinity
+      real     th3d_i_j(kdm)    ! th3d(i,j,:,n) potential density
+      real       dp_i_j(kdm)    !   dp(i,j,:,n) layer thicknesses
+      real        p_i_j(kdm+1)  !    p(i,j,:)   interface depths
 !
       do i=1,ii
       if (SEA_P) then
+        do k= 1,kdm
+          theta_i_j(k) = theta(i,j,k)
+             dp_i_j(k) =    dp(i,j,k,n)
+           temp_i_j(k) =  temp(i,j,k,n)
+           saln_i_j(k) =  saln(i,j,k,n)
+           th3d_i_j(k) =  th3d(i,j,k,n)
+        enddo
+        call hybgenaij_init(   n,i,j, &
+                               dp_i_j, &
+                               fixlay,qdep,qhrlx,dp0ij,dp0cum, &
+                               p_i_j)
+        call hybgenaij_unmix(  n,i,j, &
+                               theta_i_j, &
+                               temp_i_j,saln_i_j,th3d_i_j, &
+                               fixlay,qdep,qhrlx, &
+                               p_i_j)
+        call hybgenaij_regrid( n,i,j, &
+                               theta_i_j, &
+                               fixlay,qhrlx,dp0ij,dp0cum, &
+                               th3d_i_j, p_i_j, &
+                               pres)
+        call hybgenaij_remap(  n,i,j, &
+                               theta_i_j, &
+                               fixlay, &
+                               pres,p_i_j,dp_i_j, &
+                               temp_i_j,saln_i_j,th3d_i_j)
+        do k= 1,kdm
+           temp(i,j,k,n) = temp_i_j(k)
+           saln(i,j,k,n) = saln_i_j(k)
+           th3d(i,j,k,n) = th3d_i_j(k)
+             dp(i,j,k,n) =   dp_i_j(k)
+        enddo
+        do k= 1,kdm+1
+          p(i,j,k) = p_i_j(k)
+        enddo
+      endif !ip
+      enddo !i
+!
+      return
+      end subroutine hybgenaj
+
+      subroutine hybgenaij_init(n,i,j, &
+                                dp_i_j, &
+                                fixlay,qdep,qhrlx,dp0ij,dp0cum, &
+                                p_i_j)
+      use mod_xc           ! HYCOM communication interface
+      use mod_cb_arrays,&  ! HYCOM saved arrays
+       only : nhybrd, &  !number of hybrid levels (typically kdm)
+              nsigma, &  !number of sigma  levels (nhybrd-nsigma z-levels)
+              dp0k, &    !layer deep    z-level spacing minimum thicknesses
+              ds0k, &    !layer shallow z-level spacing minimum thicknesses
+              dp00i, &   !deep iso-pycnal spacing minimum thickness
+              dpns, &    !sum(dp0k(k),k=1,nsigma)
+              dsns, &    !sum(ds0k(k),k=1,nsigma)
+              depths, &  !depth
+              topiso, &  !shallowest depth for isopycnal layers
+              qhybrlx, & !relxation coefficient, 1/s
+              qonem      !1.0/onem
+      implicit none
+!
+      integer n, i,j
+      integer, intent(out)   :: fixlay           !deepest fixed coordinate layer
+      real,    intent(out)   :: qdep             !fraction dp0k (vs ds0k)
+      real,    intent(out)   :: qhrlx( kdm+1), & !relaxation coefficient
+                                dp0ij( kdm),   & !minimum layer thickness
+                                dp0cum(kdm+1)    !minimum interface depth
+      real,    intent(in)    ::    dp_i_j(kdm)   !   dp(i,j,:,n)
+      real,    intent(out)   ::     p_i_j(kdm+1) !    p(i,j,:)
+!
+! --- --------------------------------------------------------------
+! --- hybrid grid generator, single column(part A) - initialization.
+! --- --------------------------------------------------------------
+!
+      real    hybrlx,q,qts
+      integer k,fixall
+!
+      hybrlx = 1.0/qhybrlx
 !
 ! --- terrain following starts at depth dpns and ends at depth dsns
+! --- and the depth of the k-th layer interface varies linearly with 
+! --- total depth between these two reference depths.
+
       if     (dpns.eq.dsns) then
         qdep = 1.0  !not terrain following
       else
@@ -279,7 +348,7 @@
 !
       if     (qdep.lt.1.0) then
 ! ---   terrain following, qhrlx=1 and ignore dp00
-        p(i,j, 1)=0.0
+        p_i_j( 1)=0.0
         dp0cum(1)=0.0
         qhrlx( 1)=1.0
         dp0ij( 1)=qdep*dp0k(1) + (1.0-qdep)*ds0k(1)
@@ -289,26 +358,26 @@
 !diag         write (lp,'(a/i6,1x,4f9.3/a)') &
 !diag         '     k     dp0ij     ds0k     dp0k        p', &
 !diag         k,dp0ij(k)*qonem,ds0k(1)*qonem,dp0k(1)*qonem, &
-!diag                                  p(i,j,k)*qonem, &
+!diag                                  p_i_j(k)*qonem, &
 !diag         '     k     dp0ij    p-cum        p   dp0cum'
 !diag       endif !debug
         dp0cum(2)=dp0cum(1)+dp0ij(1)
         qhrlx( 2)=1.0
-        p(i,j, 2)=p(i,j,1)+dp(i,j,1,n)
+        p_i_j( 2)=p_i_j(1)+dp_i_j(1)
         do k=2,kk
           qhrlx( k+1)=1.0
           dp0ij( k)  =qdep*dp0k(k) + (1.0-qdep)*ds0k(k)
           dp0cum(k+1)=dp0cum(k)+dp0ij(k)
-          p(i,j, k+1)=p(i,j,k)+dp(i,j,k,n)
+          p_i_j( k+1)=p_i_j(k)+dp_i_j(k)
 !diag         if (i.eq.itest .and. j.eq.jtest) then
 !diag           write (lp,'(i6,1x,4f9.3)') &
-!diag           k,dp0ij(k)*qonem,p(i,j,k)*qonem-dp0cum(k)*qonem, &
-!diag                            p(i,j,k)*qonem,dp0cum(k)*qonem
+!diag           k,dp0ij(k)*qonem,p_i_j(k)*qonem-dp0cum(k)*qonem, &
+!diag                            p_i_j(k)*qonem,dp0cum(k)*qonem
 !diag         endif !debug
         enddo !k
       else
 ! ---   not terrain following
-        p(i,j, 1)=0.0
+        p_i_j( 1)=0.0
         dp0cum(1)=0.0
         qhrlx( 1)=1.0 !no relaxation in top layer
         dp0ij( 1)=dp0k(1)
@@ -321,7 +390,7 @@
 !diag       endif !debug
         dp0cum(2)=dp0cum(1)+dp0ij(1)
         qhrlx( 2)=1.0 !no relaxation in top layer
-        p(i,j, 2)=p(i,j,1)+dp(i,j,1,n)
+        p_i_j( 2)=p_i_j(1)+dp_i_j(1)
         do k=2,kk
 ! ---     q is dp0k(k) when in surface fixed coordinates
 ! ---     q is dp00i   when much deeper than surface fixed coordinates
@@ -332,18 +401,18 @@
             q  = max( dp00i, &
                       dp0k(k) * dp0k(k)/ &
                                 max( dp0k( k), &
-                                     p(i,j,k)-dp0cum(k) ) )
+                                     p_i_j(k)-dp0cum(k) ) )
             qts= 1.0 - (q-dp00i)/(dp0k(k)-dp00i)  !0 at dp0k, 1 at dp00i
           endif
           qhrlx( k+1)=1.0/(1.0 + qts*(hybrlx-1.0))  !1 at  dp0k, qhybrlx at dp00i
           dp0ij( k)  =min( q, dp0k(k) )
           dp0cum(k+1)=dp0cum(k)+dp0ij(k)
-          p(i,j, k+1)=p(i,j,k)+dp(i,j,k,n)
+          p_i_j( k+1)=p_i_j(k)+dp_i_j(k)
 !diag         if (i.eq.itest .and. j.eq.jtest) then
 !diag           write (lp,'(i6,1x,6f9.3)') &
 !diag           k,dp0ij(k)*qonem,dp0k(k)*qonem,q*qonem, &
-!diag             p(i,j,k)*qonem-dp0cum(k)*qonem, &
-!diag             p(i,j,k)*qonem,dp0cum(k)*qonem
+!diag             p_i_j(k)*qonem-dp0cum(k)*qonem, &
+!diag             p_i_j(k)*qonem,dp0cum(k)*qonem
 !diag         endif !debug
         enddo !k
       endif !qdep<1:else
@@ -369,13 +438,13 @@
       do k= fixall+1,nhybrd
 !diag        if (i.eq.itest .and. j.eq.jtest) then
 !diag          write (lp,'(i6,1x,2f9.3)') &
-!diag            k,p(i,j,k+1)*qonem,dp0cum(k+1)*qonem
+!diag            k,p_i_j(k+1)*qonem,dp0cum(k+1)*qonem
 !diag          call flush(lp)
 !diag        endif !debug
-        if     (p(i,j,k+1).gt.dp0cum(k+1)+0.1*dp0ij(k)) then
+        if     (p_i_j(k+1).gt.dp0cum(k+1)+0.1*dp0ij(k)) then
           if     (fixlay.gt.fixall) then
 ! ---       should the previous layer remain fixed?
-            if     (p(i,j,k).gt.dp0cum(k)) then
+            if     (p_i_j(k).gt.dp0cum(k)) then
               fixlay = fixlay-1
             endif
           endif
@@ -395,17 +464,68 @@
 !diag      if (i.eq.itest .and. j.eq.jtest) then
 !diag        write (lp,'(a/(i6,1x,2f8.3,2f9.3,f9.3))') &
 !diag        'hybgen:   thkns  minthk     dpth  mindpth   hybrlx', &
-!diag        (k,dp(i,j,k,n)*qonem,   dp0ij(k)*qonem, &
-!diag            p(i,j,k+1)*qonem,dp0cum(k+1)*qonem, &
+!diag        (k,dp_i_j(k)*qonem,   dp0ij(k)*qonem, &
+!diag            p_i_j(k+1)*qonem,dp0cum(k+1)*qonem, &
 !diag            1.0/qhrlx(k+1), &
 !diag         k=1,kk)
 !diag      endif !debug
+      return
+      end subroutine hybgenaij_init
+
+      subroutine hybgenaij_unmix(n,i,j, &
+                                 theta_i_j, &
+                                 temp_i_j,saln_i_j,th3d_i_j, &
+                                 fixlay,qdep,qhrlx, &
+                                 p_i_j)
+      use mod_xc           ! HYCOM communication interface
+      use mod_cb_arrays,&  ! HYCOM saved arrays
+       only : nhybrd, &  !number of hybrid levels (typically kdm)
+              ntracr, &  !number of tracers
+              trcflg, &  !tracer flags
+              tracer, &  !tracer prognostic field
+              mxlmy, &   !Mellor-Yamada mixed layer flag
+              q2, &      !M-Y tke     prognostic field
+              q2l, &     !M-Y tke*len prognostic field
+              thbase, &  !reference density (sigma units)
+              hybflg, &  !HYBGEN:generator flag (0=T&S), usually 0
+              hybiso, &  !Use PCM if layer is within hybiso of target density
+              itest, &   !grid point where detailed diagnostics are desired
+              jtest, &   !grid point where detailed diagnostics are desired
+              onemm, &   !one mm in pressure units
+              epsil      !small nonzero to prevent division by zero
+      implicit none
+!
+      integer n, i,j
+      integer, intent(in)    :: fixlay           !deepest fixed coordinate layer
+      real,    intent(in)    :: qdep             !fraction dp0k (vs ds0k)
+      real,    intent(in)    :: qhrlx( kdm+1)    !relaxation coefficient
+      real,    intent(in)    :: theta_i_j(kdm)   !theta(i,j,:) target density
+      real,    intent(inout) ::  temp_i_j(kdm)   ! temp(i,j,:,n)
+      real,    intent(inout) ::  saln_i_j(kdm)   ! saln(i,j,:,n)
+      real,    intent(inout) ::  th3d_i_j(kdm)   ! th3d(i,j,:,n)
+      real,    intent(inout) ::     p_i_j(kdm+1) !    p(i,j,:)
+!
+! --- ------------------------------------------------------------------
+! --- hybrid grid generator, single column(part A) - ummix lowest layer.
+! --- ------------------------------------------------------------------
+!
+      logical, parameter :: lunmix=.true.     !unmix a too light deepest layer
+      integer, parameter :: ndebug_tracer=0   !tracer to debug, usually 0 (off)
+!
+      integer k,ka,kp,ktr,fixall
+      real    p_hat,dpthin, &
+              delt,deltm,dels,delsm,q,qtr,qts
+      real    s1d(kdm,mxtrcr+4) !original scalar fields
+!
+# include "stmt_fns.h"
+!
+      dpthin = 0.001*onemm
 !
 ! --- identify the deepest layer kp with significant thickness (> dpthin)
 !
       kp = 2  !minimum allowed value
       do k=kk,3,-1
-        if (p(i,j,k+1)-p(i,j,k).ge.dpthin) then
+        if (p_i_j(k+1)-p_i_j(k).ge.dpthin) then
           kp=k
           exit
         endif
@@ -421,10 +541,10 @@
       ka = max(k-2,1)  !k might be 2
 !
       if     (k.gt.fixlay+1 .and. qdep.eq.1.0 .and.   & !layer not fixed depth
-              p(i,j,k)-p(i,j,k-1).ge.dpthin   .and.   & !layer above not too thin
-              theta(i,j,k)-epsil.gt.th3d(i,j,k,n) .and. &
-               th3d(i,j,k-1,n)  .gt.th3d(i,j,k,n) .and. &
-               th3d(i,j,ka, n)  .gt.th3d(i,j,k,n)      ) then
+              p_i_j(k)-p_i_j(k-1).ge.dpthin   .and.   & !layer above not too thin
+              theta_i_j(k)-epsil.gt.th3d_i_j(k) .and. &
+               th3d_i_j(k-1)    .gt.th3d_i_j(k) .and. &
+               th3d_i_j(ka)     .gt.th3d_i_j(k)        ) then
 !
 ! ---   water in the deepest inflated layer with significant thickness
 ! ---   (kp) is too light, and it is lighter than the two layers above.
@@ -434,25 +554,25 @@
 ! ---
 ! ---   entrain the entire layer into the one above
 !---    note the double negative in T=T-q*(T-T'), equiv. to T=T+q*(T'-T)
-        q = (p(i,j,k+1)-p(i,j,k))/(p(i,j,k+1)-p(i,j,k-1))
+        q = (p_i_j(k+1)-p_i_j(k))/(p_i_j(k+1)-p_i_j(k-1))
         if     (hybflg.eq.0) then  !T&S
-          temp(i,j,k-1,n)=temp(i,j,k-1,n)-q*(temp(i,j,k-1,n) - &
-                                             temp(i,j,k,  n)  )
-          saln(i,j,k-1,n)=saln(i,j,k-1,n)-q*(saln(i,j,k-1,n) - &
-                                             saln(i,j,k,  n)  )
-          th3d(i,j,k-1,n)=sig(temp(i,j,k-1,n),saln(i,j,k-1,n))-thbase
+          temp_i_j(k-1)=temp_i_j(k-1)-q*(temp_i_j(k-1) - &
+                                         temp_i_j(k)  )
+          saln_i_j(k-1)=saln_i_j(k-1)-q*(saln_i_j(k-1) - &
+                                         saln_i_j(k)  )
+          th3d_i_j(k-1)=sig(temp_i_j(k-1),saln_i_j(k-1))-thbase
         elseif (hybflg.eq.1) then  !th&S
-          th3d(i,j,k-1,n)=th3d(i,j,k-1,n)-q*(th3d(i,j,k-1,n) - &
-                                             th3d(i,j,k,  n)  )
-          saln(i,j,k-1,n)=saln(i,j,k-1,n)-q*(saln(i,j,k-1,n) - &
-                                             saln(i,j,k,  n)  )
-          temp(i,j,k-1,n)=tofsig(th3d(i,j,k-1,n)+thbase,saln(i,j,k-1,n))
+          th3d_i_j(k-1)=th3d_i_j(k-1)-q*(th3d_i_j(k-1) - &
+                                         th3d_i_j(k)  )
+          saln_i_j(k-1)=saln_i_j(k-1)-q*(saln_i_j(k-1) - &
+                                         saln_i_j(k)  )
+          temp_i_j(k-1)=tofsig(th3d_i_j(k-1)+thbase,saln_i_j(k-1))
         elseif (hybflg.eq.2) then  !th&T
-          th3d(i,j,k-1,n)=th3d(i,j,k-1,n)-q*(th3d(i,j,k-1,n) - &
-                                             th3d(i,j,k,  n)  )
-          temp(i,j,k-1,n)=temp(i,j,k-1,n)-q*(temp(i,j,k-1,n) - &
-                                             temp(i,j,k,  n)  )
-          saln(i,j,k-1,n)=sofsig(th3d(i,j,k-1,n)+thbase,temp(i,j,k-1,n))
+          th3d_i_j(k-1)=th3d_i_j(k-1)-q*(th3d_i_j(k-1) - &
+                                         th3d_i_j(k)  )
+          temp_i_j(k-1)=temp_i_j(k-1)-q*(temp_i_j(k-1) - &
+                                         temp_i_j(k)  )
+          saln_i_j(k-1)=sofsig(th3d_i_j(k-1)+thbase,temp_i_j(k-1))
         endif
           if (ndebug_tracer.gt.0 .and. ndebug_tracer.le.ntracr .and. &
               i.eq.itest .and. j.eq.jtest) then
@@ -487,21 +607,21 @@
                            q*(q2l(i,j,k-1,n)-q2l(i,j,k,n))
         endif
 ! ---   entrained the entire layer into the one above, so now kp=kp-1
-        p(i,j,k) = p(i,j,k+1)
+        p_i_j(k) = p_i_j(k+1)
         kp = k-1
 !diag        if (i.eq.itest .and. j.eq.jtest) then
 !diag          write(lp,'(a,i3,f6.3,5f8.3)') &
 !diag            'hybgen, 11(+):', &
-!diag            k-1,q,temp(i,j,k-1,n),saln(i,j,k-1,n), &
-!diag                th3d(i,j,k-1,n)+thbase,theta(i,j,k-1)+thbase
+!diag            k-1,q,temp_i_j(k-1),saln_i_j(k-1), &
+!diag                th3d_i_j(k-1)+thbase,theta_i_j(k-1)+thbase
 !diag          write(lp,'(a,i3)') &
 !diag                'hybgen, deepest inflated layer:',kp
 !diag          call flush(lp)
 !diag        endif !debug
       elseif (k.gt.fixlay+1 .and. qdep.eq.1.0 .and.   & !layer not fixed depth
-              p(i,j,k)-p(i,j,k-1).ge.dpthin   .and.   & !layer above not too thin
-              theta(i,j,k)-epsil.gt.th3d(i,j,k,n) .and. &
-               th3d(i,j,k-1,n)  .gt.th3d(i,j,k,n)      ) then
+              p_i_j(k)-p_i_j(k-1).ge.dpthin   .and.   & !layer above not too thin
+              theta_i_j(k)-epsil.gt.th3d_i_j(k) .and. &
+               th3d_i_j(k-1)    .gt.th3d_i_j(k)      ) then
 !
 ! ---   water in the deepest inflated layer with significant thickness
 ! ---   (kp) is too light, and it is lighter than the layer above.
@@ -510,44 +630,44 @@
 !diag        if (i.eq.itest .and. j.eq.jtest) then
 !diag          write(lp,'(a,i3,f8.5,5f10.5)') &
 !diag            'hybgen, original:', &
-!diag            k-1,0.0,temp(i,j,k-1,n),saln(i,j,k-1,n), &
-!diag                th3d(i,j,k-1,n)+thbase,theta(i,j,k-1)+thbase
+!diag            k-1,0.0,temp_i_j(k-1),saln_i_j(k-1), &
+!diag                th3d_i_j(k-1)+thbase,theta_i_j(k-1)+thbase
 !diag          write(lp,'(a,i3,f8.5,5f10.5)') &
 !diag            'hybgen, original:', &
-!diag            k,0.0,temp(i,j,k,  n),saln(i,j,k,  n), &
-!diag                th3d(i,j,k,  n)+thbase,theta(i,j,k  )+thbase
+!diag            k,0.0,temp_i_j(k),saln_i_j(k), &
+!diag                th3d_i_j(k)+thbase,theta_i_j(k  )+thbase
 !diag        endif !debug
-        if     (p(i,j,k+1)-p(i,j,k).le.p(i,j,k)-p(i,j,k-1)) then
+        if     (p_i_j(k+1)-p_i_j(k).le.p_i_j(k)-p_i_j(k-1)) then
 ! ---     bottom layer is thinner, take entire bottom layer
 !---      note the double negative in T=T-q*(T-T'), equiv. to T=T+q*(T'-T)
-          s1d(k-1,1) = temp(i,j,k-1,n)
-          s1d(k-1,2) = saln(i,j,k-1,n)
-          s1d(k-1,3) = th3d(i,j,k-1,n)
-          q = (p(i,j,k+1)-p(i,j,k))/(p(i,j,k)-p(i,j,k-1))  !<=1.0
+          s1d(k-1,1) = temp_i_j(k-1)
+          s1d(k-1,2) = saln_i_j(k-1)
+          s1d(k-1,3) = th3d_i_j(k-1)
+          q = (p_i_j(k+1)-p_i_j(k))/(p_i_j(k)-p_i_j(k-1))  !<=1.0
           if     (hybflg.eq.0) then  !T&S
-            temp(i,j,k-1,n)=temp(i,j,k-1,n)-q*(temp(i,j,k-1,n) - &
-                                               temp(i,j,k,  n)  )
-            saln(i,j,k-1,n)=saln(i,j,k-1,n)-q*(saln(i,j,k-1,n) - &
-                                               saln(i,j,k,  n)  )
-            th3d(i,j,k-1,n)=sig(temp(i,j,k-1,n),saln(i,j,k-1,n))-thbase
+            temp_i_j(k-1)=temp_i_j(k-1)-q*(temp_i_j(k-1) - &
+                                           temp_i_j(k)  )
+            saln_i_j(k-1)=saln_i_j(k-1)-q*(saln_i_j(k-1) - &
+                                           saln_i_j(k)  )
+            th3d_i_j(k-1)=sig(temp_i_j(k-1),saln_i_j(k-1))-thbase
           elseif (hybflg.eq.1) then  !th&S
-            th3d(i,j,k-1,n)=th3d(i,j,k-1,n)-q*(th3d(i,j,k-1,n) - &
-                                               th3d(i,j,k,  n)  )
-            saln(i,j,k-1,n)=saln(i,j,k-1,n)-q*(saln(i,j,k-1,n) - &
-                                               saln(i,j,k,  n)  )
-            temp(i,j,k-1,n)=tofsig(th3d(i,j,k-1,n)+thbase, &
-                                   saln(i,j,k-1,n))
+            th3d_i_j(k-1)=th3d_i_j(k-1)-q*(th3d_i_j(k-1) - &
+                                           th3d_i_j(k)  )
+            saln_i_j(k-1)=saln_i_j(k-1)-q*(saln_i_j(k-1) - &
+                                           saln_i_j(k)  )
+            temp_i_j(k-1)=tofsig(th3d_i_j(k-1)+thbase, &
+                                 saln_i_j(k-1))
           elseif (hybflg.eq.2) then  !th&T
-            th3d(i,j,k-1,n)=th3d(i,j,k-1,n)-q*(th3d(i,j,k-1,n) - &
-                                               th3d(i,j,k,  n)  )
-            temp(i,j,k-1,n)=temp(i,j,k-1,n)-q*(temp(i,j,k-1,n) - &
-                                               temp(i,j,k,  n)  )
-            saln(i,j,k-1,n)=sofsig(th3d(i,j,k-1,n)+thbase, &
-                                   temp(i,j,k-1,n))
+            th3d_i_j(k-1)=th3d_i_j(k-1)-q*(th3d_i_j(k-1) - &
+                                           th3d_i_j(k)  )
+            temp_i_j(k-1)=temp_i_j(k-1)-q*(temp_i_j(k-1) - &
+                                           temp_i_j(k)  )
+            saln_i_j(k-1)=sofsig(th3d_i_j(k-1)+thbase, &
+                                 temp_i_j(k-1))
           endif
-          temp(i,j,k,n) = s1d(k-1,1)
-          saln(i,j,k,n) = s1d(k-1,2)
-          th3d(i,j,k,n) = s1d(k-1,3)
+          temp_i_j(k) = s1d(k-1,1)
+          saln_i_j(k) = s1d(k-1,2)
+          th3d_i_j(k) = s1d(k-1,3)
           do ktr= 1,ntracr
             s1d(k-1,2+ktr)        = tracer(i,j,k-1,n,ktr)
             tracer(i,j,k-1,n,ktr) = tracer(i,j,k-1,n,ktr)- &
@@ -567,32 +687,32 @@
           endif
         else
 ! ---     bottom layer is thicker, take entire layer above
-          s1d(k,1) = temp(i,j,k,n)
-          s1d(k,2) = saln(i,j,k,n)
-          s1d(k,3) = th3d(i,j,k,n)
-          q = (p(i,j,k)-p(i,j,k-1))/(p(i,j,k+1)-p(i,j,k))  !<1.0
+          s1d(k,1) = temp_i_j(k)
+          s1d(k,2) = saln_i_j(k)
+          s1d(k,3) = th3d_i_j(k)
+          q = (p_i_j(k)-p_i_j(k-1))/(p_i_j(k+1)-p_i_j(k))  !<1.0
           if     (hybflg.eq.0) then  !T&S
-            temp(i,j,k,n)=temp(i,j,k,n)+q*(temp(i,j,k-1,n) - &
-                                           temp(i,j,k,  n)  )
-            saln(i,j,k,n)=saln(i,j,k,n)+q*(saln(i,j,k-1,n) - &
-                                             saln(i,j,k,  n)  )
-            th3d(i,j,k,n)=sig(temp(i,j,k,n),saln(i,j,k,n))-thbase
+            temp_i_j(k)=temp_i_j(k)+q*(temp_i_j(k-1) - &
+                                       temp_i_j(k)  )
+            saln_i_j(k)=saln_i_j(k)+q*(saln_i_j(k-1) - &
+                                       saln_i_j(k)  )
+            th3d_i_j(k)=sig(temp_i_j(k),saln_i_j(k))-thbase
           elseif (hybflg.eq.1) then  !th&S
-            th3d(i,j,k,n)=th3d(i,j,k,n)+q*(th3d(i,j,k-1,n) - &
-                                           th3d(i,j,k,  n)  )
-            saln(i,j,k,n)=saln(i,j,k,n)+q*(saln(i,j,k-1,n) - &
-                                           saln(i,j,k,  n)  )
-            temp(i,j,k,n)=tofsig(th3d(i,j,k,n)+thbase,saln(i,j,k,n))
+            th3d_i_j(k)=th3d_i_j(k)+q*(th3d_i_j(k-1) - &
+                                       th3d_i_j(k)  )
+            saln_i_j(k)=saln_i_j(k)+q*(saln_i_j(k-1) - &
+                                       saln_i_j(k)  )
+            temp_i_j(k)=tofsig(th3d_i_j(k)+thbase,saln_i_j(k))
           elseif (hybflg.eq.2) then  !th&T
-            th3d(i,j,k,n)=th3d(i,j,k,n)+q*(th3d(i,j,k-1,n) - &
-                                           th3d(i,j,k,  n)  )
-            temp(i,j,k,n)=temp(i,j,k,n)+q*(temp(i,j,k-1,n) - &
-                                           temp(i,j,k,  n)  )
-            saln(i,j,k,n)=sofsig(th3d(i,j,k,n)+thbase,temp(i,j,k,n))
+            th3d_i_j(k)=th3d_i_j(k)+q*(th3d_i_j(k-1) - &
+                                       th3d_i_j(k)  )
+            temp_i_j(k)=temp_i_j(k)+q*(temp_i_j(k-1) - &
+                                       temp_i_j(k)  )
+            saln_i_j(k)=sofsig(th3d_i_j(k)+thbase,temp_i_j(k))
           endif
-          temp(i,j,k-1,n) = s1d(k,1)
-          saln(i,j,k-1,n) = s1d(k,2)
-          th3d(i,j,k-1,n) = s1d(k,3)
+          temp_i_j(k-1) = s1d(k,1)
+          saln_i_j(k-1) = s1d(k,2)
+          th3d_i_j(k-1) = s1d(k,3)
           do ktr= 1,ntracr
             s1d(k,2+ktr)          = tracer(i,j,k,n,ktr)
             tracer(i,j,k,  n,ktr) = tracer(i,j,k,n,ktr)+ &
@@ -614,12 +734,12 @@
 !diag        if (i.eq.itest .and. j.eq.jtest) then
 !diag          write(lp,'(a,i3,f8.5,5f10.5)') &
 !diag            'hybgen, overturn:', &
-!diag            k-1,q,temp(i,j,k-1,n),saln(i,j,k-1,n), &
-!diag                th3d(i,j,k-1,n)+thbase,theta(i,j,k-1)+thbase
+!diag            k-1,q,temp_i_j(k-1),saln_i_j(k-1), &
+!diag                th3d_i_j(k-1)+thbase,theta_i_j(k-1)+thbase
 !diag          write(lp,'(a,i3,f8.5,5f10.5)') &
 !diag            'hybgen, overturn:', &
-!diag            k,  q,temp(i,j,k,  n),saln(i,j,k,  n), &
-!diag                th3d(i,j,k,  n)+thbase,theta(i,j,k  )+thbase
+!diag            k,  q,temp_i_j(k),saln_i_j(k), &
+!diag                th3d_i_j(k)+thbase,theta_i_j(k  )+thbase
 !diag          call flush(lp)
 !diag        endif !debug
       endif
@@ -629,12 +749,12 @@
 !
       if     (lunmix        .and.  & !usually .true.
               k.gt.fixlay+1 .and. qdep.eq.1.0 .and.   & !layer not fixed depth
-              p(i,j,k)-p(i,j,k-1).ge.dpthin   .and.   & !layer above not too thin
-               theta(i,j,k)-epsil.gt.th3d(i,j,k,  n) .and. &
-               theta(i,j,k-1)    .lt.th3d(i,j,k,  n) .and. &
-           abs(theta(i,j,k-1)-       th3d(i,j,k-1,n)).lt.hybiso .and. &
-              ( th3d(i,j,k,n)-       th3d(i,j,k-1,n)).gt. &
-              (theta(i,j,k)  -      theta(i,j,k-1)  )*0.001  ) then
+              p_i_j(k)-p_i_j(k-1).ge.dpthin   .and.   & !layer above not too thin
+               theta_i_j(k)-epsil.gt.th3d_i_j(k) .and. &
+               theta_i_j(k-1)    .lt.th3d_i_j(k) .and. &
+           abs(theta_i_j(k-1)-  th3d_i_j(k-1)).lt.hybiso .and. &
+              ( th3d_i_j(k)-    th3d_i_j(k-1)).gt. &
+              (theta_i_j(k)  - theta_i_j(k-1)  )*0.001  ) then
 !
 ! ---   water in the deepest inflated layer with significant thickness
 ! ---   (kp) is too light, with the layer above near-isopycnal
@@ -655,25 +775,25 @@
 !
         ka = 1
         do ktr= k-2,2,-1
-          if     ( th3d(i,j,k-1,n)- th3d(i,j,ktr,n).ge. &
-                  theta(i,j,k-1)  -theta(i,j,k-2)     ) then
+          if     ( th3d_i_j(k-1)- th3d_i_j(ktr).ge. &
+                  theta_i_j(k-1)  -theta_i_j(k-2)     ) then
             ka = ktr  !usually k-2
             exit
           endif
         enddo !ktr
 !
-        delsm=abs(saln(i,j,ka, n)-saln(i,j,k-1,n))
-        dels =abs(saln(i,j,k-1,n)-saln(i,j,k,  n))
-        deltm=abs(temp(i,j,ka, n)-temp(i,j,k-1,n))
-        delt =abs(temp(i,j,k-1,n)-temp(i,j,k,  n))
+        delsm=abs(saln_i_j(ka) -saln_i_j(k-1))
+        dels =abs(saln_i_j(k-1)-saln_i_j(k))
+        deltm=abs(temp_i_j(ka) -temp_i_j(k-1))
+        delt =abs(temp_i_j(k-1)-temp_i_j(k))
 ! ---   sanity check on deltm and delsm
-        q=min(temp(i,j,ka, n),temp(i,j,k-1,n),temp(i,j,k,n))
+        q=min(temp_i_j(ka),temp_i_j(k-1),temp_i_j(k))
         if     (q.gt. 6.0) then
-          deltm=min( deltm,  6.0*(theta(i,j,k)-theta(i,j,k-1)) )
+          deltm=min( deltm,  6.0*(theta_i_j(k)-theta_i_j(k-1)) )
         else  !(q.le. 6.0)
-          deltm=min( deltm, 10.0*(theta(i,j,k)-theta(i,j,k-1)) )
+          deltm=min( deltm, 10.0*(theta_i_j(k)-theta_i_j(k-1)) )
         endif
-        delsm=min( delsm, 1.3*(theta(i,j,k)-theta(i,j,k-1)) )
+        delsm=min( delsm, 1.3*(theta_i_j(k)-theta_i_j(k-1)) )
         qts=0.0
         if     (delt.gt.epsil) then
           qts=max(qts, (min(deltm, 2.0*delt)-delt)/delt)  ! qts<=1.0
@@ -681,31 +801,31 @@
         if     (dels.gt.epsil) then
           qts=max(qts, (min(delsm, 2.0*dels)-dels)/dels)  ! qts<=1.0
         endif
-        q=(theta(i,j,k)-th3d(i,j,k,  n))/ &
-          (theta(i,j,k)-th3d(i,j,k-1,n))
+        q=(theta_i_j(k)-th3d_i_j(k))/ &
+          (theta_i_j(k)-th3d_i_j(k-1))
         q=min(q,qts/(1.0+qts))  ! upper sublayer <= 50% of total
         q=qhrlx(k)*q
 ! ---   qhrlx is relaxation coefficient (inverse baroclinic time steps)
-        p_hat=q*(p(i,j,k+1)-p(i,j,k))
-        p(i,j,k)=p(i,j,k)+p_hat
+        p_hat=q*(p_i_j(k+1)-p_i_j(k))
+        p_i_j(k)=p_i_j(k)+p_hat
         if     (hybflg.eq.0) then  !T&S
-          temp(i,j,k,n)=temp(i,j,k,n)+(q/(1.0-q))*(temp(i,j,k,n)  - &
-                                                   temp(i,j,k-1,n) )
-          saln(i,j,k,n)=saln(i,j,k,n)+(q/(1.0-q))*(saln(i,j,k,n)  - &
-                                                   saln(i,j,k-1,n) )
-          th3d(i,j,k,n)=sig(temp(i,j,k,n),saln(i,j,k,n))-thbase
+          temp_i_j(k)=temp_i_j(k)+(q/(1.0-q))*(temp_i_j(k)  - &
+                                               temp_i_j(k-1) )
+          saln_i_j(k)=saln_i_j(k)+(q/(1.0-q))*(saln_i_j(k)  - &
+                                               saln_i_j(k-1) )
+          th3d_i_j(k)=sig(temp_i_j(k),saln_i_j(k))-thbase
         elseif (hybflg.eq.1) then  !th&S
-          th3d(i,j,k,n)=th3d(i,j,k,n)+(q/(1.0-q))*(th3d(i,j,k,n)  - &
-                                                   th3d(i,j,k-1,n) )
-          saln(i,j,k,n)=saln(i,j,k,n)+(q/(1.0-q))*(saln(i,j,k,n)  - &
-                                                   saln(i,j,k-1,n) )
-          temp(i,j,k,n)=tofsig(th3d(i,j,k,n)+thbase,saln(i,j,k,n))
+          th3d_i_j(k)=th3d_i_j(k)+(q/(1.0-q))*(th3d_i_j(k)  - &
+                                               th3d_i_j(k-1) )
+          saln_i_j(k)=saln_i_j(k)+(q/(1.0-q))*(saln_i_j(k)  - &
+                                               saln_i_j(k-1) )
+          temp_i_j(k)=tofsig(th3d_i_j(k)+thbase,saln_i_j(k))
         elseif (hybflg.eq.2) then  !th&T
-          th3d(i,j,k,n)=th3d(i,j,k,n)+(q/(1.0-q))*(th3d(i,j,k,n)  - &
-                                                   th3d(i,j,k-1,n) )
-          temp(i,j,k,n)=temp(i,j,k,n)+(q/(1.0-q))*(temp(i,j,k,n)  - &
-                                                   temp(i,j,k-1,n) )
-          saln(i,j,k,n)=sofsig(th3d(i,j,k,n)+thbase,temp(i,j,k,n))
+          th3d_i_j(k)=th3d_i_j(k)+(q/(1.0-q))*(th3d_i_j(k)  - &
+                                               th3d_i_j(k-1) )
+          temp_i_j(k)=temp_i_j(k)+(q/(1.0-q))*(temp_i_j(k)  - &
+                                               temp_i_j(k-1) )
+          saln_i_j(k)=sofsig(th3d_i_j(k)+thbase,temp_i_j(k))
         endif
         if     (ntracr.gt.0 .and. p_hat.ne.0.0) then
             if (ndebug_tracer.gt.0 .and. ndebug_tracer.le.ntracr .and. &
@@ -717,7 +837,7 @@
               call flush(lp)
             endif !debug_tracer
 ! ---     fraction of new upper layer from old lower layer
-          qtr=p_hat/max(p_hat,p(i,j,k)-p(i,j,k-1))  !between 0 and 1
+          qtr=p_hat/max(p_hat,p_i_j(k)-p_i_j(k-1))  !between 0 and 1
           do ktr= 1,ntracr
             if     (trcflg(ktr).eq.2) then !temperature tracer
               tracer(i,j,k,n,ktr)=tracer(i,j,k,n,ktr)+ &
@@ -730,7 +850,7 @@
 !diag              if (i.eq.itest .and. j.eq.jtest) then
 !diag                write(lp,'(a,i4,i3,5e12.3)') &
 !diag                  'hybgen, 10(+):', &
-!diag                  k,ktr,p_hat,p(i,j,k),p(i,j,k-1), &
+!diag                  k,ktr,p_hat,p_i_j(k),p_i_j(k-1), &
 !diag                  qtr,tracer(i,j,k-1,n,ktr)
 !diag                call flush(lp)
 !diag              endif !debug
@@ -752,7 +872,7 @@
         endif !tracers
         if (mxlmy .and. p_hat.ne.0.0) then
 ! ---     fraction of new upper layer from old lower layer
-          qtr=p_hat/max(p_hat,p(i,j,k)-p(i,j,k-1))  !between 0 and 1
+          qtr=p_hat/max(p_hat,p_i_j(k)-p_i_j(k-1))  !between 0 and 1
           q2( i,j,k-1,n)=q2( i,j,k-1,n)+ &
                            qtr*(q2( i,j,k,n)-q2( i,j,k-1,n))
           q2l(i,j,k-1,n)=q2l(i,j,k-1,n)+ &
@@ -760,23 +880,23 @@
 !diag              if (i.eq.itest .and. j.eq.jtest) then
 !diag               write(lp,'(a,i4,i3,6e12.3)') &
 !diag                  'hybgen, 10(+):', &
-!diag                  k,0,p_hat,p(i,j,k)-p(i,j,k-1),p(i,j,k+1)-p(i,j,k), &
-!diag                  qtr,q2(i,j,k-1,n),q2l(i,j,k-1,n)
+!diag                  k,0,p_hat,p_i_j(k)-p_i_j(k-1),p_i_j(k+1)-p_i_j(k), &
+!diag                  qtr,q2_i_j(k-1,n),q2l(i,j,k-1,n)
 !diag               call flush(lp)
 !diag              endif !debug
         endif
 !diag        if (i.eq.itest .and. j.eq.jtest) then
 !diag          write(lp,'(a,i3,f6.3,5f8.3)') &
 !diag            'hybgen, 10(+):', &
-!diag            k,q,temp(i,j,k,n),saln(i,j,k,n), &
-!diag                th3d(i,j,k,n)+thbase,theta(i,j,k)+thbase
+!diag            k,q,temp_i_j(k),saln_i_j(k), &
+!diag                th3d_i_j(k)+thbase,theta_i_j(k)+thbase
 !diag          call flush(lp)
 !diag        endif !debug
 !diag        if (i.eq.itest .and. j.eq.jtest) then
 !diag          write(lp,'(a,i3,f6.3,5f8.3)') &
 !diag            'hybgen, 10(-):', &
-!diag            k,0.0,temp(i,j,k,n),saln(i,j,k,n), &
-!diag                th3d(i,j,k,n)+thbase,theta(i,j,k)+thbase
+!diag            k,0.0,temp_i_j(k),saln_i_j(k), &
+!diag                th3d_i_j(k)+thbase,theta_i_j(k)+thbase
 !diag          call flush(lp)
 !diag        endif !debug
       endif !too light
@@ -786,21 +906,21 @@
       do k=kp+1,kk
         if (k.le.nhybrd) then
 ! ---     fill thin and massless layers on sea floor with fluid from above
-          th3d(i,j,k,n)=th3d(i,j,k-1,n)
-          saln(i,j,k,n)=saln(i,j,k-1,n)
-          temp(i,j,k,n)=temp(i,j,k-1,n)
-        elseif (th3d(i,j,k,n).ne.theta(i,j,k)) then
+          th3d_i_j(k)=th3d_i_j(k-1)
+          saln_i_j(k)=saln_i_j(k-1)
+          temp_i_j(k)=temp_i_j(k-1)
+        elseif (th3d_i_j(k).ne.theta_i_j(k)) then
           if (hybflg.ne.2) then
 ! ---       fill with saln from above
-            th3d(i,j,k,n)=max(theta(i,j,k), th3d(i,j,k-1,n))
-            saln(i,j,k,n)=saln(i,j,k-1,n)
-            temp(i,j,k,n)=tofsig(th3d(i,j,k,n)+thbase,saln(i,j,k,n))
-            saln(i,j,k,n)=sofsig(th3d(i,j,k,n)+thbase,temp(i,j,k,n))
+            th3d_i_j(k)=max(theta_i_j(k), th3d_i_j(k-1))
+            saln_i_j(k)=saln_i_j(k-1)
+            temp_i_j(k)=tofsig(th3d_i_j(k)+thbase,saln_i_j(k))
+            saln_i_j(k)=sofsig(th3d_i_j(k)+thbase,temp_i_j(k))
           else
 ! ---       fill with temp from above
-            th3d(i,j,k,n)=max(theta(i,j,k), th3d(i,j,k-1,n))
-            temp(i,j,k,n)=temp(i,j,k-1,n)
-            saln(i,j,k,n)=sofsig(th3d(i,j,k,n)+thbase,temp(i,j,k,n))
+            th3d_i_j(k)=max(theta_i_j(k), th3d_i_j(k-1))
+            temp_i_j(k)=temp_i_j(k-1)
+            saln_i_j(k)=sofsig(th3d_i_j(k)+thbase,temp_i_j(k))
           endif
         endif
         do ktr= 1,ntracr
@@ -819,42 +939,75 @@
           q2l(i,j,k,n)=q2l(i,j,k-1,n)
         endif
       enddo !k
+      return
+      end subroutine hybgenaij_unmix
+
+      subroutine hybgenaij_regrid(n,i,j, &
+                                  theta_i_j, &
+                                  fixlay,qhrlx,dp0ij,dp0cum, &
+                                  th3d_i_j, p_i_j, &
+                                  pres)
+      use mod_xc         ! HYCOM communication interface
+      use mod_cb_arrays,&  ! HYCOM saved arrays
+       only : nhybrd, &  !number of hybrid levels (typically kdm)
+              itest, &   !grid point where detailed diagnostics are desired
+              jtest, &   !grid point where detailed diagnostics are desired
+              thbase, &  !reference density (sigma units)
+              thkbot, &  !thickness of bottom boundary layer (m)
+              onemm, &   !one mm in pressure units
+              onem,  &   !one m  in pressure units
+              tenm,  &   !ten m  in pressure units
+              qonem, &   !1.0/onem
+              epsil      !small nonzero to prevent division by zero
+      implicit none
 !
-! --- store one-dimensional arrays of -temp-, -saln-, and -p- for the 'old'
+      integer n, i,j
+      integer, intent(in)    :: fixlay           !deepest fixed coordinate layer
+      real,    intent(in)    :: qhrlx( kdm+1), & !relaxation coefficient
+                                dp0ij( kdm),   & !minimum layer thickness
+                                dp0cum(kdm+1)    !minimum interface depth
+      real,    intent(in)    :: theta_i_j(kdm)   !theta(i,j,:) target density
+      real,    intent(in)    ::  th3d_i_j(kdm)   ! th3d(i,j,:,n)
+      real,    intent(inout) ::     p_i_j(kdm+1) !p(i,j,:) layer interfaces
+      real,    intent(out)   :: pres(kdm+1)      !original layer interfaces
+!
+! --- ------------------------------------------------------
+! --- hybrid grid generator, single column(part A) - regrid.
+! --- ------------------------------------------------------
+!
+      real    p_hat,p_hat0,p_hat2,p_hat3, &
+              q,qtr,thkbop, &
+              zthk,dpthin
+      integer k,ka,ktr
+!diag character*12 cinfo
+!
+      double precision, parameter ::   zp5=0.5    !for sign function
+!
+! --- c u s h i o n   function (from Bleck & Benjamin, 1992):
+! --- if delp >= qqmx*dp0 >>  dp0, -cushn- returns -delp-
+! --- if delp <= qqmn*dp0 << -dp0, -cushn- returns  -dp0-
+!
+      real       qqmn,qqmx,cusha,cushb
+      parameter (qqmn=-4.0, qqmx=2.0)  ! shifted range
+!     parameter (qqmn=-2.0, qqmx=4.0)  ! traditional range
+!     parameter (qqmn=-4.0, qqmx=6.0)  ! somewhat wider range
+      parameter (cusha=qqmn**2*(qqmx-1.0)/(qqmx-qqmn)**2)
+      parameter (cushb=1.0/qqmn)
+!
+      real qq,cushn,delp,dp0
+      qq(   delp,dp0)=max(qqmn, min(qqmx, delp/dp0))
+      cushn(delp,dp0)=dp0* &
+                      (1.0+cusha*(1.0-cushb*qq(delp,dp0))**2)* &
+                      max(1.0, delp/(dp0*qqmx))
+!
+      dpthin = 0.001*onemm
+      thkbop = thkbot*onem
+!
+! --- store one-dimensional arrays of -p- for the 'old'
 ! --- vertical grid before attempting to restore isopycnic conditions
-      pres(1)=p(i,j,1)
+      pres(1)=p_i_j(1)
       do k=1,kk
-        if     (hybflg.eq.0) then  !T&S
-          s1d(k,1) = temp(i,j,k,n)
-          s1d(k,2) = saln(i,j,k,n)
-        elseif (hybflg.eq.1) then  !th&S
-          s1d(k,1) = th3d(i,j,k,n)
-          s1d(k,2) = saln(i,j,k,n)
-        elseif (hybflg.eq.2) then  !th&T
-          s1d(k,1) = th3d(i,j,k,n)
-          s1d(k,2) = temp(i,j,k,n)
-        endif
-        do ktr= 1,ntracr
-          s1d(k,2+ktr) = tracer(i,j,k,n,ktr)
-        enddo !ktr
-        if (mxlmy) then
-          s1d(k,ntracr+3) = q2( i,j,k,n)
-          s1d(k,ntracr+4) = q2l(i,j,k,n)
-        endif
-        pres(k+1)=p(i,j,k+1)
-        dprs(k)  =pres(k+1)-pres(k)
-        dpi( k)  =max(dprs(k),dpthin)
-!
-        if     (isopcm) then
-          if     (k.le.fixlay) then
-            lcm(k) = .false.  !fixed layers are never PCM
-          else
-! ---       thin and isopycnal layers remapped with PCM.
-            lcm(k) = k.gt.nhybrd &
-                     .or. dprs(k).le.dpthin &
-                     .or. abs(th3d(i,j,k,n)-theta(i,j,k)).lt.hybiso
-          endif !k<=fixlay:else
-        endif !isopcm
+        pres(k+1)=p_i_j(k+1)
       enddo !k
 !
 ! --- try to restore isopycnic conditions by moving layer interfaces
@@ -864,13 +1017,13 @@
 !
 ! ---   maintain constant thickness, layer k = 1
         k=1
-        p_hat=p(i,j,k)+dp0ij(k)
-        p(i,j,k+1)=p_hat
+        p_hat=p_i_j(k)+dp0ij(k)
+        p_i_j(k+1)=p_hat
         do k=2,kk
-          if     (p(i,j,k+1).ge.p_hat) then
+          if     (p_i_j(k+1).ge.p_hat) then
             exit  ! usually get here quickly
           endif
-          p(i,j,k+1)=p_hat
+          p_i_j(k+1)=p_hat
         enddo !k
       endif
 !
@@ -906,14 +1059,14 @@
 !
 ! ---     maintain constant thickness, k <= fixlay
           if     (k.lt.kk) then  !p.kk+1 not changed
-            p(i,j,k+1)=min(dp0cum(k+1),p(i,j,kk+1))
+            p_i_j(k+1)=min(dp0cum(k+1),p_i_j(kk+1))
             if     (k.eq.fixlay) then
 ! ---         enforce interface order (may not be necessary).
               do ka= k+2,kk
-                if     (p(i,j,ka).ge.p(i,j,k+1)) then
+                if     (p_i_j(ka).ge.p_i_j(k+1)) then
                   exit  ! usually get here quickly
                 else
-                  p(i,j,ka) = p(i,j,k+1)
+                  p_i_j(ka) = p_i_j(k+1)
                 endif
               enddo !ka
             endif !k.eq.fixlay
@@ -921,49 +1074,49 @@
 !
 !diag     if (i.eq.itest .and. j.eq.jtest) then
 !diag       write(lp,'(a,i3.2,f8.2)') 'hybgen, fixlay :', &
-!diag                                 k+1,p(i,j,k+1)*qonem
+!diag                                 k+1,p_i_j(k+1)*qonem
 !diag       call flush(lp)
 !diag     endif !debug
         else
 !
 ! ---     do not maintain constant thickness, k > fixlay
 !
-          if     (th3d(i,j,k,n).gt.theta(i,j,k)+epsil .and. &
+          if     (th3d_i_j(k).gt.theta_i_j(k)+epsil .and. &
                   k.gt.fixlay+1) then 
 !
 ! ---       water in layer k is too dense
 ! ---       try to dilute with water from layer k-1
 ! ---       do not move interface if k = fixlay + 1
 !
-            if (th3d(i,j,k-1,n).ge.theta(i,j,k-1) .or. &
-                p(i,j,k).le.dp0cum(k)+onem .or. &
-                p(i,j,k+1)-p(i,j,k).le.p(i,j,k)-p(i,j,k-1)) then
+            if (th3d_i_j(k-1).ge.theta_i_j(k-1) .or. &
+                p_i_j(k).le.dp0cum(k)+onem .or. &
+                p_i_j(k+1)-p_i_j(k).le.p_i_j(k)-p_i_j(k-1)) then
 !
 ! ---         if layer k-1 is too light, thicken the thinner of the two,
 ! ---         i.e. skip this layer if it is thicker.
 !
 !diag         if (i.eq.itest .and. j.eq.jtest) then
 !diag           write(lp,'(a,3x,i2.2,1pe13.5)') &
-!diag                 'hybgen, too dense:',k,th3d(i,j,k,n)-theta(i,j,k)
+!diag                 'hybgen, too dense:',k,th3d_i_j(k)-theta_i_j(k)
 !diag         call flush(lp)
 !diag         endif !debug
 ! 
-              if     ((theta(i,j,k)-th3d(i,j,k-1,n)).le.epsil) then
+              if     ((theta_i_j(k)-th3d_i_j(k-1)).le.epsil) then
 !               layer k-1 much too dense, take entire layer
-                p_hat=p(i,j,k-1)+dp0ij(k-1)
+                p_hat=p_i_j(k-1)+dp0ij(k-1)
               else
-                q=(theta(i,j,k)-th3d(i,j,k,  n))/ &
-                  (theta(i,j,k)-th3d(i,j,k-1,n))         ! -1 <= q < 0
-                p_hat0=p(i,j,k)+q*(p(i,j,k+1)-p(i,j,k))  ! <p(i,j,k)
+                q=(theta_i_j(k)-th3d_i_j(k))/ &
+                  (theta_i_j(k)-th3d_i_j(k-1))         ! -1 <= q < 0
+                p_hat0=p_i_j(k)+q*(p_i_j(k+1)-p_i_j(k))  ! <p_i_j(k)
                 if     (k.eq.fixlay+2) then
 ! ---             treat layer k-1 as fixed.
-                  p_hat =p(i,j,k-1)+  max(p_hat0-p(i,j,k-1),dp0ij(k-1))
+                  p_hat =p_i_j(k-1)+  max(p_hat0-p_i_j(k-1),dp0ij(k-1))
                 else
 ! ---             maintain minimum thickess of layer k-1.
-                  p_hat =p(i,j,k-1)+cushn(p_hat0-p(i,j,k-1),dp0ij(k-1))
+                  p_hat =p_i_j(k-1)+cushn(p_hat0-p_i_j(k-1),dp0ij(k-1))
                 endif !fixlay+2:else
               end if
-              p_hat=min(p_hat,p(i,j,kk+1))
+              p_hat=min(p_hat,p_i_j(kk+1))
 !
 ! ---         if isopycnic conditions cannot be achieved because of a blocking
 ! ---         layer in the interior ocean, move interface k-1 (and k-2 if
@@ -971,99 +1124,99 @@
 !
               if     (k.le.fixlay+2) then
 ! ---           do nothing.
-              else if (p_hat.ge.p(i,j,k) .and. &
-                       p(i,j,k-1).gt.dp0cum(k-1)+tenm .and. &
-                      (p(i,j,kk+1)-p(i,j,k-1).lt.thkbop .or. &
-                       p(i,j,k-1) -p(i,j,k-2).gt.qqmx*dp0ij(k-2))) then ! k.gt.2
+              else if (p_hat.ge.p_i_j(k) .and. &
+                       p_i_j(k-1).gt.dp0cum(k-1)+tenm .and. &
+                      (p_i_j(kk+1)-p_i_j(k-1).lt.thkbop .or. &
+                       p_i_j(k-1) -p_i_j(k-2).gt.qqmx*dp0ij(k-2))) then ! k.gt.2
                 if     (k.eq.fixlay+3) then
 ! ---             treat layer k-2 as fixed.
-                  p_hat2=p(i,j,k-2)+ &
-                           max(p(i,j,k-1)-p_hat+p_hat0-p(i,j,k-2), &
+                  p_hat2=p_i_j(k-2)+ &
+                           max(p_i_j(k-1)-p_hat+p_hat0-p_i_j(k-2), &
                                dp0ij(k-2))
                 else
 ! ---             maintain minimum thickess of layer k-2.
-                  p_hat2=p(i,j,k-2)+ &
-                         cushn(p(i,j,k-1)-p_hat+p_hat0-p(i,j,k-2), &
+                  p_hat2=p_i_j(k-2)+ &
+                         cushn(p_i_j(k-1)-p_hat+p_hat0-p_i_j(k-2), &
                                dp0ij(k-2))
                 endif !fixlay+3:else
-                if (p_hat2.lt.p(i,j,k-1)-onemm) then
-                  p(i,j,k-1)=(1.0-qhrlx(k-1))*p(i,j,k-1) + &
+                if (p_hat2.lt.p_i_j(k-1)-onemm) then
+                  p_i_j(k-1)=(1.0-qhrlx(k-1))*p_i_j(k-1) + &
                                   qhrlx(k-1) *max(p_hat2, &
-                                          2.0*p(i,j,k-1)-p_hat)
+                                          2.0*p_i_j(k-1)-p_hat)
 !diag             if (i.eq.itest .and. j.eq.jtest) then
 !diag               write(lp,'(a,i3.2,f8.2)') 'hybgen,  1blocking :', &
-!diag                     k-1,p(i,j,k-1)*qonem
+!diag                     k-1,p_i_j(k-1)*qonem
 !diag               call flush(lp)
 !diag             endif !debug
-                  p_hat=p(i,j,k-1)+cushn(p_hat0-p(i,j,k-1),dp0ij(k-1))
+                  p_hat=p_i_j(k-1)+cushn(p_hat0-p_i_j(k-1),dp0ij(k-1))
                 elseif (k.le.fixlay+3) then
 ! ---             do nothing.
-                elseif (p(i,j,k-2).gt.dp0cum(k-2)+tenm .and. &
-                       (p(i,j,kk+1)-p(i,j,k-2).lt.thkbop .or. &
-                        p(i,j,k-2) -p(i,j,k-3).gt.qqmx*dp0ij(k-3))) then
+                elseif (p_i_j(k-2).gt.dp0cum(k-2)+tenm .and. &
+                       (p_i_j(kk+1)-p_i_j(k-2).lt.thkbop .or. &
+                        p_i_j(k-2) -p_i_j(k-3).gt.qqmx*dp0ij(k-3))) then
                   if     (k.eq.fixlay+4) then
 ! ---               treat layer k-3 as fixed.
-                    p_hat3=p(i,j,k-3)+  max(p(i,j,k-2)-p_hat+ &
-                                      p_hat0-p(i,j,k-3), &
+                    p_hat3=p_i_j(k-3)+  max(p_i_j(k-2)-p_hat+ &
+                                      p_hat0-p_i_j(k-3), &
                                       dp0ij(k-3))
                   else
 ! ---               maintain minimum thickess of layer k-3.
-                    p_hat3=p(i,j,k-3)+cushn(p(i,j,k-2)-p_hat+ &
-                                      p_hat0-p(i,j,k-3), &
+                    p_hat3=p_i_j(k-3)+cushn(p_i_j(k-2)-p_hat+ &
+                                      p_hat0-p_i_j(k-3), &
                                       dp0ij(k-3))
                   endif !fixlay+4:else
-                  if (p_hat3.lt.p(i,j,k-2)-onemm) then
-                    p(i,j,k-2)=(1.0-qhrlx(k-2))*p(i,j,k-2) + &
+                  if (p_hat3.lt.p_i_j(k-2)-onemm) then
+                    p_i_j(k-2)=(1.0-qhrlx(k-2))*p_i_j(k-2) + &
                                     qhrlx(k-2)*max(p_hat3, &
-                                            2.0*p(i,j,k-2)-p(i,j,k-1))
+                                            2.0*p_i_j(k-2)-p_i_j(k-1))
 !diag               if (i.eq.itest .and. j.eq.jtest) then
 !diag                 write(lp,'(a,i3.2,f8.2)') 'hybgen,  2blocking :', &
-!diag                       k-2,p(i,j,k-2)*qonem
+!diag                       k-2,p_i_j(k-2)*qonem
 !diag                 call flush(lp)
 !diag               endif !debug
-                    p_hat2=p(i,j,k-2)+cushn(p(i,j,k-1)-p_hat+ &
-                                            p_hat0-p(i,j,k-2), &
+                    p_hat2=p_i_j(k-2)+cushn(p_i_j(k-1)-p_hat+ &
+                                            p_hat0-p_i_j(k-2), &
                                             dp0ij(k-2))
-                    if (p_hat2.lt.p(i,j,k-1)-onemm) then
-                      p(i,j,k-1)=(1.0-qhrlx(k-1))*p(i,j,k-1) + &
+                    if (p_hat2.lt.p_i_j(k-1)-onemm) then
+                      p_i_j(k-1)=(1.0-qhrlx(k-1))*p_i_j(k-1) + &
                                       qhrlx(k-1) *max(p_hat2, &
-                                              2.0*p(i,j,k-1)-p_hat)
+                                              2.0*p_i_j(k-1)-p_hat)
 !diag                 if (i.eq.itest .and. j.eq.jtest) then
 !diag                   write(lp,'(a,i3.2,f8.2)') 'hybgen,  3blocking :', &
-!diag                              k-1,p(i,j,k-1)*qonem
+!diag                              k-1,p_i_j(k-1)*qonem
 !diag                   call flush(lp)
 !diag                 endif !debug
-                      p_hat=p(i,j,k-1)+cushn(p_hat0-p(i,j,k-1), &
+                      p_hat=p_i_j(k-1)+cushn(p_hat0-p_i_j(k-1), &
                                              dp0ij(k-1))
                     endif !p_hat2
                   endif !p_hat3
                 endif !p_hat2:blocking
               endif !blocking
 !
-              if (p_hat.lt.p(i,j,k)) then
+              if (p_hat.lt.p_i_j(k)) then
 ! ---           entrain layer k-1 water into layer k, move interface up.
-                p(i,j,k)=(1.0-qhrlx(k))*p(i,j,k) + &
+                p_i_j(k)=(1.0-qhrlx(k))*p_i_j(k) + &
                               qhrlx(k) *p_hat
               endif !entrain
 !
 !diag         if (i.eq.itest .and. j.eq.jtest) then
 !diag           write(lp,'(a,i3.2,f8.2)') 'hybgen, entrain(k) :', &
-!diag                                     k,p(i,j,k)*qonem
+!diag                                     k,p_i_j(k)*qonem
 !diag           call flush(lp)
 !diag         endif !debug
 !
             endif  !too-dense adjustment
 !
-          elseif (th3d(i,j,k,n).lt.theta(i,j,k)-epsil) then   ! layer too light
+          elseif (th3d_i_j(k).lt.theta_i_j(k)-epsil) then   ! layer too light
 !
 ! ---       water in layer k is too light
 ! ---       try to dilute with water from layer k+1
 ! ---       do not entrain if layer k touches bottom
 !
-            if (p(i,j,k+1).lt.p(i,j,kk+1)) then  ! k<kk
-              if (th3d(i,j,k+1,n).le.theta(i,j,k+1) .or. &
-                  p(i,j,k+1).le.dp0cum(k+1)+onem    .or. &
-                  p(i,j,k+1)-p(i,j,k).lt.p(i,j,k+2)-p(i,j,k+1)) then
+            if (p_i_j(k+1).lt.p_i_j(kk+1)) then  ! k<kk
+              if (th3d_i_j(k+1).le.theta_i_j(k+1) .or. &
+                  p_i_j(k+1).le.dp0cum(k+1)+onem    .or. &
+                  p_i_j(k+1)-p_i_j(k).lt.p_i_j(k+2)-p_i_j(k+1)) then
 !
 ! ---           if layer k+1 is too dense, thicken the thinner of the 
 ! ---           two, i.e. skip this layer (never get here) if it is not 
@@ -1072,17 +1225,17 @@
 !diag           if (i.eq.itest .and. j.eq.jtest) then
 !diag             write(lp,'(a,3x,i2.2,1pe13.5)') &
 !diag                  'hybgen, too light:',k, &
-!diag                   theta(i,j,k)-th3d(i,j,k,n)
+!diag                   theta_i_j(k)-th3d_i_j(k)
 !diag             call flush(lp)
 !diag           endif !debug
 !
-                if     ((th3d(i,j,k+1,n)-theta(i,j,k)).le.epsil) then
+                if     ((th3d_i_j(k+1)-theta_i_j(k)).le.epsil) then
 !                 layer k-1 too light, take entire layer
-                  p_hat=p(i,j,k+2)
+                  p_hat=p_i_j(k+2)
                 else
-                  q=(th3d(i,j,k,  n)-theta(i,j,k))/ &
-                    (th3d(i,j,k+1,n)-theta(i,j,k))          !-1 <= q < 0
-                  p_hat=p(i,j,k+1)+q*(p(i,j,k)-p(i,j,k+1))  !>p(i,j,k+1)
+                  q=(th3d_i_j(k)  -theta_i_j(k))/ &
+                    (th3d_i_j(k+1)-theta_i_j(k))          !-1 <= q < 0
+                  p_hat=p_i_j(k+1)+q*(p_i_j(k)-p_i_j(k+1))  !>p_i_j(k+1)
                 endif
 !
 ! ---           if layer k+1, or layer k+2, does not touch the bottom
@@ -1090,27 +1243,27 @@
 ! ---           much as possible. otherwise, permit layers to collapse
 ! ---           to zero thickness at the bottom.  
 !
-                if     (p(i,j,min(k+3,kk+1)).lt.p(i,j,kk+1)) then
-                  if     (p(i,j,kk+1)-p(i,j,k).gt. &
+                if     (p_i_j(min(k+3,kk+1)).lt.p_i_j(kk+1)) then
+                  if     (p_i_j(kk+1)-p_i_j(k).gt. &
                           dp0ij(k)+dp0ij(k+1)     ) then
-                    p_hat=p(i,j,k+2)-cushn(p(i,j,k+2)-p_hat,dp0ij(k+1))
+                    p_hat=p_i_j(k+2)-cushn(p_i_j(k+2)-p_hat,dp0ij(k+1))
                   endif
-                  p_hat=p(i,j,k)+max(p_hat-p(i,j,k),dp0ij(k))
+                  p_hat=p_i_j(k)+max(p_hat-p_i_j(k),dp0ij(k))
                   p_hat=min(p_hat, &
-                            max(0.5*(p(i,j,k+1)+p(i,j,k+2)), &
-                                     p(i,j,k+2)-dp0ij(k+1)))
+                            max(0.5*(p_i_j(k+1)+p_i_j(k+2)), &
+                                     p_i_j(k+2)-dp0ij(k+1)))
                 else
-                  p_hat=min(p(i,j,k+2),p_hat)
+                  p_hat=min(p_i_j(k+2),p_hat)
                 endif !p.k+2<p.kk+1
-                if (p_hat.gt.p(i,j,k+1)) then
+                if (p_hat.gt.p_i_j(k+1)) then
 ! ---             entrain layer k+1 water into layer k.
-                  p(i,j,k+1)=(1.0-qhrlx(k+1))*p(i,j,k+1) + &
+                  p_i_j(k+1)=(1.0-qhrlx(k+1))*p_i_j(k+1) + &
                                   qhrlx(k+1) *p_hat
                 endif !entrain
 !
 !diag           if (i.eq.itest .and. j.eq.jtest) then
 !diag             write(lp,'(a,i3.2,f8.2)') &
-!diag                  'hybgen, entrain(k+):',k,p(i,j,k+1)*qonem
+!diag                  'hybgen, entrain(k+):',k,p_i_j(k+1)*qonem
 !diag             call flush(lp)
 !diag           endif !debug
 !
@@ -1119,15 +1272,15 @@
           endif !too dense or too light
 !
 ! ---     if layer above is still too thin, move interface down.
-          p_hat0=min(p(i,j,k-1)+dp0ij(k-1),p(i,j,kk+1))
-          if (p_hat0.gt.p(i,j,k)) then
-            p_hat =(1.0-qhrlx(k-1))*p(i,j,k)+ &
+          p_hat0=min(p_i_j(k-1)+dp0ij(k-1),p_i_j(kk+1))
+          if (p_hat0.gt.p_i_j(k)) then
+            p_hat =(1.0-qhrlx(k-1))*p_i_j(k)+ &
                         qhrlx(k-1) *p_hat0
-            p(i,j,k)=min(p_hat,p(i,j,k+1))
+            p_i_j(k)=min(p_hat,p_i_j(k+1))
 !
 !diag       if (i.eq.itest .and. j.eq.jtest) then
 !diag         write(lp,'(a,i3.2,f8.2)') &
-!diag              'hybgen, min. thknss (k+):',k-1,p(i,j,k)*qonem
+!diag              'hybgen, min. thknss (k+):',k-1,p_i_j(k)*qonem
 !diag         call flush(lp)
 !diag       endif !debug
           endif
@@ -1135,6 +1288,114 @@
         endif !k.le.fixlay:else
 !
       enddo !k  vertical coordinate relocation
+      return
+      end subroutine hybgenaij_regrid
+
+      subroutine hybgenaij_remap(n,i,j, &
+                                 theta_i_j, &
+                                 fixlay, &
+                                 pres,p_i_j,dp_i_j, &
+                                 temp_i_j,saln_i_j,th3d_i_j)
+      use mod_xc         ! HYCOM communication interface
+      use mod_cb_arrays,&  ! HYCOM saved arrays
+       only : nhybrd, &  !number of hybrid levels (typically kdm)
+              ntracr, &  !number of tracers
+              tracer, &  !tracer prognostic field
+              mxlmy, &   !Mellor-Yamada mixed layer flag
+              q2, &      !M-Y tke     prognostic field
+              q2l, &     !M-Y tke*len prognostic field
+              itest, &   !grid point where detailed diagnostics are desired
+              jtest, &   !grid point where detailed diagnostics are desired
+              thbase, &  !reference density (sigma units)
+              hybflg, &  !generator flag (0=T&S), usually 0
+              hybmap, &  !remapper  flag (2=PPM,3=WENO-like), usualy 3
+              hybiso, &  !use PCM if layer is within hybiso of target density
+              onemm, &   !one mm in pressure units
+              qonem      !1.0/onem
+      implicit none
+!
+      integer n, i,j
+      integer, intent(in)    :: fixlay           !deepest fixed coordinate layer
+      real,    intent(in)    :: theta_i_j(kdm)   !theta(i,j,:) target density
+      real,    intent(in)    ::      pres(kdm+1) !original layer interfaces
+      real,    intent(inout) ::     p_i_j(kdm+1) !     new layer interfaces
+      real,    intent(out)   ::    dp_i_j(kdm)   !   dp(i,j,:,n)
+      real,    intent(inout) ::  temp_i_j(kdm)   ! temp(i,j,:,n)
+      real,    intent(inout) ::  saln_i_j(kdm)   ! saln(i,j,:,n)
+      real,    intent(inout) ::  th3d_i_j(kdm)   ! th3d(i,j,:,n)
+!
+! --- -------------------------------------------------------------
+! --- hybrid grid generator, single column(part A) - remap scalars.
+! --- -------------------------------------------------------------
+!
+      logical, parameter :: lconserve=.false. !explicitly conserve each column
+      integer, parameter :: ndebug_tracer=0   !tracer to debug, usually 0 (off)
+!
+      double precision asum(  mxtrcr+4,3)
+      real             offset(mxtrcr+4)
+!
+      logical lcm(kdm)                !use PCM for some layers?
+      real    s1d(kdm,mxtrcr+4),    & !original scalar fields
+              f1d(kdm,mxtrcr+4),    & !final    scalar fields
+              c1d(kdm,mxtrcr+4,3),  & !interpolation coefficients
+              dpi( kdm),            & !original layer thicknesses, >= dpthin
+              dprs(kdm),            & !original layer thicknesses
+              prsf(kdm+1)             !final    layer interfaces
+      real    zthk,dpthin,q
+      integer k,ktr,nums1d
+!
+      double precision, parameter ::   zp5=0.5    !for sign function
+!
+# include "stmt_fns.h"
+!
+      dpthin = 0.001*onemm
+!
+      if (mxlmy) then
+        nums1d = ntracr + 4
+      else
+        nums1d = ntracr + 2
+      endif
+!
+! --- 'old' vertical grid fields.
+      do k=1,kk
+        if     (hybflg.eq.0) then  !T&S
+          s1d(k,1) = temp_i_j(k)
+          s1d(k,2) = saln_i_j(k)
+        elseif (hybflg.eq.1) then  !th&S
+          s1d(k,1) = th3d_i_j(k)
+          s1d(k,2) = saln_i_j(k)
+        elseif (hybflg.eq.2) then  !th&T
+          s1d(k,1) = th3d_i_j(k)
+          s1d(k,2) = temp_i_j(k)
+        endif
+        do ktr= 1,ntracr
+          s1d(k,2+ktr) = tracer(i,j,k,n,ktr)
+        enddo !ktr
+        if (mxlmy) then
+          s1d(k,ntracr+3) = q2( i,j,k,n)
+          s1d(k,ntracr+4) = q2l(i,j,k,n)
+        endif
+!
+        dprs(k)  =pres(k+1)-pres(k)
+        dpi( k)  =max(dprs(k),dpthin)
+!
+        if     (hybiso.gt.0.0) then
+          if     (k.le.fixlay) then
+            lcm(k) = .false.  !fixed layers are never PCM
+          else
+! ---       thin and isopycnal layers remapped with PCM.
+            lcm(k) = k.gt.nhybrd &
+                     .or. dprs(k).le.dpthin &
+                     .or. abs(th3d_i_j(k)-theta_i_j(k)).lt.hybiso
+          endif !k<=fixlay:else
+        else !hybiso==0.0
+          if     (k.le.nhybrd) then
+            lcm(k) = .false.  !use same remapper for all layers
+          else
+            lcm(k) = .true.   !purely isopycnal layers use PCM
+          endif !nhybrd
+        endif !hybiso
+      enddo !k
 !
 ! --- remap scalar field profiles from the 'old' vertical
 ! --- grid onto the 'new' vertical grid.
@@ -1147,12 +1408,12 @@
         enddo !ktr
       endif
 !
-      prsf(1) = p(i,j,1)
+      prsf(1) = p_i_j(1)
       do k=1,kk
-        dp(i,j,k,n) = max( p(i,j,k+1)-prsf(k), 0.0 )  !enforce interface order
+        dp_i_j(k) = max( p_i_j(k+1)-prsf(k), 0.0 )  !enforce interface order
 ! ---   to avoid roundoff errors in -dpudpv- after restart, make sure p=p(dp)
-        prsf(k+1)   = prsf(k) + dp(i,j,k,n)
-        p(i,j,k+1)  = prsf(k+1)
+        prsf(k+1)   = prsf(k) + dp_i_j(k)
+        p_i_j(k+1)  = prsf(k+1)
       enddo !k
       if     (hybmap.eq.0) then !PCM
         call hybgen_pcm_remap(s1d,pres,dprs, &
@@ -1175,21 +1436,21 @@
       endif
       do k=1,kk
         if     (hybflg.eq.0) then  !T&S
-          temp(i,j,k,n) = f1d(k,1)
-          saln(i,j,k,n) = f1d(k,2)
-          th3d(i,j,k,n)=sig(temp(i,j,k,n),saln(i,j,k,n))-thbase
+          temp_i_j(k) = f1d(k,1)
+          saln_i_j(k) = f1d(k,2)
+          th3d_i_j(k)=sig(temp_i_j(k),saln_i_j(k))-thbase
         elseif (hybflg.eq.1) then  !th&S
-          th3d(i,j,k,n) = f1d(k,1)
-          saln(i,j,k,n) = f1d(k,2)
-          temp(i,j,k,n)=tofsig(th3d(i,j,k,n)+thbase, &
-                               saln(i,j,k,n))
-!         saln(i,j,k,n)=sofsig(th3d(i,j,k,n)+thbase,
-!    &                         temp(i,j,k,n))
+          th3d_i_j(k) = f1d(k,1)
+          saln_i_j(k) = f1d(k,2)
+          temp_i_j(k)=tofsig(th3d_i_j(k)+thbase, &
+                             saln_i_j(k))
+!         saln_i_j(k)=sofsig(th3d_i_j(k)+thbase,
+!    &                       temp_i_j(k))
         elseif (hybflg.eq.2) then  !th&T
-          th3d(i,j,k,n) = f1d(k,1)
-          temp(i,j,k,n) = f1d(k,2)
-          saln(i,j,k,n)=sofsig(th3d(i,j,k,n)+thbase, &
-                               temp(i,j,k,n))
+          th3d_i_j(k) = f1d(k,1)
+          temp_i_j(k) = f1d(k,2)
+          saln_i_j(k)=sofsig(th3d_i_j(k)+thbase, &
+                             temp_i_j(k))
         endif
         do ktr= 1,ntracr
           tracer(i,j,k,n,ktr) = f1d(k,2+ktr)
@@ -1208,7 +1469,7 @@
         endif
 !
         if     (lconserve) then  !usually .false.
-          zthk = dp(i,j,k,n)
+          zthk = dp_i_j(k)
           do ktr= 1,nums1d
             asum(ktr,1) = asum(ktr,1) + s1d(k,ktr)*dprs(k)
             asum(ktr,2) = asum(ktr,2) + f1d(k,ktr)*zthk
@@ -1224,7 +1485,7 @@
 !    &  '                  thkns',
 !    &  '                   dpth',
 !    &  (k,tthe(k,1),    dprs(k)*qonem,    pres(k+1)*qonem,
-!    &   k,th3d(i,j,k,n),dp(i,j,k,n)*qonem,p(i,j,k+1)*qonem,
+!    &   k,th3d_i_j(k),dp_i_j(k)*qonem,p_i_j(k+1)*qonem,
 !    &  k=1,kk)
 !diag   write (lp,'(i9,3a/(i9,3f23.17))') &
 !diag   nstep, &
@@ -1232,7 +1493,7 @@
 !diag   '                  thkns', &
 !diag   '                   dpth', &
 !diag   (k,ttrc(      k,1,1),  dprs(k)*qonem,   pres(k+1)*qonem, &
-!diag    k,tracer(i,j,k,n,1),dp(i,j,k,n)*qonem,p(i,j,k+1)*qonem, &
+!diag    k,tracer(i,j,k,n,1),dp_i_j(k)*qonem,p_i_j(k+1)*qonem, &
 !diag   k=1,kk)
 !diag   call flush(lp)
 !diag endif !debug
@@ -1253,19 +1514,19 @@
         enddo !ktr
         do k=1,kk
           if     (hybflg.eq.0) then  !T&S
-            temp(i,j,k,n)=temp(i,j,k,n)*(1.0+offset(1))
-            saln(i,j,k,n)=saln(i,j,k,n)*(1.0+offset(2))
-            th3d(i,j,k,n)=sig(temp(i,j,k,n),saln(i,j,k,n))-thbase
+            temp_i_j(k)=temp_i_j(k)*(1.0+offset(1))
+            saln_i_j(k)=saln_i_j(k)*(1.0+offset(2))
+            th3d_i_j(k)=sig(temp_i_j(k),saln_i_j(k))-thbase
           elseif (hybflg.eq.1) then  !th&S
-            th3d(i,j,k,n)=th3d(i,j,k,n)*(1.0+offset(1))
-            saln(i,j,k,n)=saln(i,j,k,n)*(1.0+offset(2))
-            temp(i,j,k,n)=tofsig(th3d(i,j,k,n)+thbase, &
-                                 saln(i,j,k,n))
+            th3d_i_j(k)=th3d_i_j(k)*(1.0+offset(1))
+            saln_i_j(k)=saln_i_j(k)*(1.0+offset(2))
+            temp_i_j(k)=tofsig(th3d_i_j(k)+thbase, &
+                               saln_i_j(k))
           elseif (hybflg.eq.2) then  !th&T
-            th3d(i,j,k,n)=th3d(i,j,k,n)*(1.0+offset(1))
-            temp(i,j,k,n)=temp(i,j,k,n)*(1.0+offset(2))
-            saln(i,j,k,n)=sofsig(th3d(i,j,k,n)+thbase, &
-                                 temp(i,j,k,n))
+            th3d_i_j(k)=th3d_i_j(k)*(1.0+offset(1))
+            temp_i_j(k)=temp_i_j(k)*(1.0+offset(2))
+            saln_i_j(k)=sofsig(th3d_i_j(k)+thbase, &
+                               temp_i_j(k))
           endif
           do ktr= 1,ntracr
             tracer(i,j,k,n,ktr)=tracer(i,j,k,n,ktr)*(1.0+offset(ktr+2))
@@ -1276,16 +1537,16 @@
           endif
 !
           if     (.false.) then !debugging
-            zthk = dp(i,j,k,n)
+            zthk = dp_i_j(k)
             if     (hybflg.eq.0) then  !T&S
-              asum(1,3) = asum(1,3) + temp(i,j,k,n)*zthk
-              asum(2,3) = asum(2,3) + saln(i,j,k,n)*zthk
+              asum(1,3) = asum(1,3) + temp_i_j(k)*zthk
+              asum(2,3) = asum(2,3) + saln_i_j(k)*zthk
             elseif (hybflg.eq.1) then  !th&S
-              asum(1,3) = asum(1,3) + th3d(i,j,k,n)*zthk
-              asum(2,3) = asum(2,3) + saln(i,j,k,n)*zthk
+              asum(1,3) = asum(1,3) + th3d_i_j(k)*zthk
+              asum(2,3) = asum(2,3) + saln_i_j(k)*zthk
             elseif (hybflg.eq.2) then  !th&T
-              asum(1,3) = asum(1,3) + th3d(i,j,k,n)*zthk
-              asum(2,3) = asum(2,3) + temp(i,j,k,n)*zthk
+              asum(1,3) = asum(1,3) + th3d_i_j(k)*zthk
+              asum(2,3) = asum(2,3) + temp_i_j(k)*zthk
             endif
             do ktr= 1,ntracr
               asum(ktr+2,3) = asum(ktr+2,3) + tracer(i,j,k,n,ktr)*zthk
@@ -1302,9 +1563,9 @@
           do ktr= 1,nums1d
             write(lp,'(a,1p4e16.8,i3)') &
               'hybgen,sum:', &
-              asum(ktr,1)/p(i,j,kk+1), &
-              asum(ktr,2)/p(i,j,kk+1), &
-              asum(ktr,3)/p(i,j,kk+1), &
+              asum(ktr,1)/p_i_j(kk+1), &
+              asum(ktr,2)/p_i_j(kk+1), &
+              asum(ktr,3)/p_i_j(kk+1), &
               offset(ktr),ktr
           enddo !ktr
         endif !debugging .and. i.eq.itest .and. j.eq.jtest
@@ -1315,9 +1576,9 @@
           if     (abs(offset(ktr)).gt.1.e-12) then
             write(lp,'(a,1p4e16.8,i3)') &
               'hybgen,sum:', &
-              asum(ktr,1)/p(i,j,kk+1), &
-              asum(ktr,2)/p(i,j,kk+1), &
-              asum(ktr,3)/p(i,j,kk+1), &
+              asum(ktr,1)/p_i_j(kk+1), &
+              asum(ktr,2)/p_i_j(kk+1), &
+              asum(ktr,3)/p_i_j(kk+1), &
               offset(ktr),i
           endif !large offset
         endif !debugging .and. j.eq.jtest
@@ -1330,7 +1591,7 @@
 !    &  '                  thkns',
 !    &  '                   dpth',
 !    &  (k,tthe(k,1),    dprs(k)*qonem,    pres(k+1)*qonem,
-!    &   k,th3d(i,j,k,n),dp(i,j,k,n)*qonem,p(i,j,k+1)*qonem,
+!    &   k,th3d_i_j(k),dp_i_j(k)*qonem,p_i_j(k+1)*qonem,
 !    &  k=1,kk)
 !diag   write (lp,'(i9,3a/(i9,3f23.17))') &
 !diag   nstep, &
@@ -1338,7 +1599,7 @@
 !diag   '                  thkns', &
 !diag   '                   dpth', &
 !diag   (k,ttrc(      k,1,1),  dprs(k)*qonem,   pres(k+1)*qonem, &
-!diag    k,tracer(i,j,k,n,1),dp(i,j,k,n)*qonem,p(i,j,k+1)*qonem, &
+!diag    k,tracer(i,j,k,n,1),dp_i_j(k)*qonem,p_i_j(k+1)*qonem, &
 !diag   k=1,kk)
 !diag   call flush(lp)
 !diag endif
@@ -1350,37 +1611,34 @@
 !diag        '    hybgen, do 22:  temp    saln    dens     thkns     dpth', &
 !diag        (k,s1d(k,1),s1d(k,2),0.0, &
 !diag         (pres(k+1)-pres(k))*qonem,pres(k+1)*qonem, &
-!diag         k,temp(i,j,k,n),saln(i,j,k,n), &
-!diag         th3d(i,j,k,n)+thbase,dp(i,j,k,n)*qonem, &
-!diag         p(i,j,k+1)*qonem, &
+!diag         k,temp_i_j(k),saln_i_j(k), &
+!diag         th3d_i_j(k)+thbase,dp_i_j(k)*qonem, &
+!diag         p_i_j(k+1)*qonem, &
 !diag        k=1,kk)
 !diag       elseif (hybflg.eq.1) then  !th&S
 !diag        write (lp,103) nstep,itest+i0,jtest+j0, &
 !diag        '    hybgen, do 22:  temp    saln    dens     thkns     dpth', &
 !diag        (k,0.0,s1d(k,2),s1d(k,1)+thbase, &
 !diag         (pres(k+1)-pres(k))*qonem,pres(k+1)*qonem, &
-!diag         k,temp(i,j,k,n),saln(i,j,k,n), &
-!diag         th3d(i,j,k,n)+thbase,dp(i,j,k,n)*qonem, &
-!diag         p(i,j,k+1)*qonem, &
+!diag         k,temp_i_j(k),saln_i_j(k), &
+!diag         th3d_i_j(k)+thbase,dp_i_j(k)*qonem, &
+!diag         p_i_j(k+1)*qonem, &
 !diag        k=1,kk)
 !diag       elseif (hybflg.eq.2) then  !th&T
 !diag        write (lp,103) nstep,itest+i0,jtest+j0, &
 !diag        '    hybgen, do 22:  temp    saln    dens     thkns     dpth', &
 !diag        (k,s1d(k,2),0.0,s1d(k,1)+thbase, &
 !diag         (pres(k+1)-pres(k))*qonem,pres(k+1)*qonem, &
-!diag         k,temp(i,j,k,n),saln(i,j,k,n), &
-!diag         th3d(i,j,k,n)+thbase,dp(i,j,k,n)*qonem, &
-!diag         p(i,j,k+1)*qonem, &
+!diag         k,temp_i_j(k),saln_i_j(k), &
+!diag         th3d_i_j(k)+thbase,dp_i_j(k)*qonem, &
+!diag         p_i_j(k+1)*qonem, &
 !diag        k=1,kk)
 !diag       endif
 !diag       call flush(lp)
 !diag      endif !debug
 !
-      endif !ip
-      enddo !i
-!
       return
-      end subroutine hybgenaj
+      end subroutine hybgenaij_remap
 
       subroutine hybgenbj(nl, j)
       use mod_xc         ! HYCOM communication interface
@@ -1562,7 +1820,6 @@
               dp0cum(kdm+1)        !minimum interface depth
       real    dpold,dpmid,dpnew,q,qdep,zthk,dpthin
       integer i,k,ktr,fixlay,nums1d
-      character*12 cinfo
 !
       double precision, parameter ::   zp5=0.5    !for sign function
 !
