@@ -247,15 +247,19 @@
               dp0cum(kdm+1)     !minimum interface depth
       real    pres(kdm+1)       !original layer interfaces
 !
-      real    theta_i_j(kdm)    !theta(i,j,:)   target potential density
-      real     temp_i_j(kdm)    ! temp(i,j,:,n) potential temperature
-      real     saln_i_j(kdm)    ! saln(i,j,:,n) salinity
-      real     th3d_i_j(kdm)    ! th3d(i,j,:,n) potential density
-      real       dp_i_j(kdm)    !   dp(i,j,:,n) layer thicknesses
-      real        p_i_j(kdm+1)  !    p(i,j,:)   interface depths
+      real    theta_i_j(kdm)    ! theta(i,j,:)   target potential density
+      real     temp_i_j(kdm)    !  temp(i,j,:,n) potential temperature
+      real     saln_i_j(kdm)    !  saln(i,j,:,n) salinity
+      real     th3d_i_j(kdm)    !  th3d(i,j,:,n) potential density
+      real       dp_i_j(kdm)    !    dp(i,j,:,n) layer thicknesses
+      real        p_i_j(kdm+1)  !     p(i,j,:)   interface depths
+      real   depths_i_j         !depths(i,j)     depth
+      real   topiso_i_j         !topiso(i,j)     shallowest depth for isopycnal layers
 !
       do i=1,ii
       if (SEA_P) then
+        depths_i_j = depths(i,j)
+        topiso_i_j = topiso(i,j)
         do k= 1,kdm
           theta_i_j(k) = theta(i,j,k)
              dp_i_j(k) =    dp(i,j,k,n)
@@ -263,7 +267,12 @@
            saln_i_j(k) =  saln(i,j,k,n)
            th3d_i_j(k) =  th3d(i,j,k,n)
         enddo
-        call hybgenaij_init(   n,i,j, &
+        call hybgenaij_init(   i,j,kdm, &
+!diag                          itest,jtest,lp, &
+                               nhybrd,nsigma, &
+                               dp0k,ds0k,dp00i,topiso_i_j,qhybrlx, &
+                               dpns,dsns, &
+                               depths_i_j,qonem, &
                                dp_i_j, &
                                fixlay,qdep,qhrlx,dp0ij,dp0cum, &
                                p_i_j)
@@ -272,7 +281,11 @@
                                temp_i_j,saln_i_j,th3d_i_j, &
                                fixlay,qdep,qhrlx, &
                                p_i_j)
-        call hybgenaij_regrid( n,i,j, &
+        call hybgenaij_regrid( i,j,kdm, &
+!diag                          itest,jtest,lp, &
+                               nhybrd,&
+                               thbase,thkbot, &
+                               onemm,onem,tenm,qonem,epsil, &
                                theta_i_j, &
                                fixlay,qhrlx,dp0ij,dp0cum, &
                                th3d_i_j, p_i_j, &
@@ -297,53 +310,76 @@
       return
       end subroutine hybgenaj
 
-      subroutine hybgenaij_init(n,i,j, &
+      subroutine hybgenaij_init(i,j,kdm, &
+!diag                           itest,jtest,lp, &
+                                nhybrd,nsigma, &
+                                dp0k,ds0k,dp00i,topiso_i_j,qhybrlx, &
+                                dpns,dsns, &
+                                depths_i_j,qonem, &
                                 dp_i_j, &
                                 fixlay,qdep,qhrlx,dp0ij,dp0cum, &
                                 p_i_j)
-      use mod_xc           ! HYCOM communication interface
-      use mod_cb_arrays,&  ! HYCOM saved arrays
-       only : nhybrd, &  !number of hybrid levels (typically kdm)
-              nsigma, &  !number of sigma  levels (nhybrd-nsigma z-levels)
-              dp0k, &    !layer deep    z-level spacing minimum thicknesses
-              ds0k, &    !layer shallow z-level spacing minimum thicknesses
-              dp00i, &   !deep iso-pycnal spacing minimum thickness
-              dpns, &    !sum(dp0k(k),k=1,nsigma)
-              dsns, &    !sum(ds0k(k),k=1,nsigma)
-              depths, &  !depth
-              topiso, &  !shallowest depth for isopycnal layers
-              qhybrlx, & !relxation coefficient, 1/s
-              qonem      !1.0/onem
       implicit none
 !
-      integer n, i,j
+      integer, intent(in)    :: &
+                i,j, &          !grid point, for diagnostics
+!diag           itest,jtest, &  !printout this point
+!diag           lp, &           !output unit
+                kdm, &          !number of layers
+                nhybrd, &       !number of hybrid layers (typically kdm)
+                nsigma          !number of sigma  levels (nhybrd-nsigma z-levels)
+      real,    intent(in)    :: &
+                dp0k(kdm),    & !layer deep    z-level spacing minimum thicknesses
+                ds0k(nsigma), & !layer shallow z-level spacing minimum thicknesses
+                dp00i, &        !deep iso-pycnal spacing minimum thickness
+                topiso_i_j, &   !shallowest depth for isopycnal layers
+                qhybrlx, &      !relxation coefficient, 1/s
+                depths_i_j, &   !depths(i,j), depth (m)
+                qonem, &        !1.0/1m in pressure units
+                dp_i_j(kdm)     !dp(i,j,:,n), layer thicknesses
       integer, intent(out)   :: fixlay           !deepest fixed coordinate layer
       real,    intent(out)   :: qdep             !fraction dp0k (vs ds0k)
       real,    intent(out)   :: qhrlx( kdm+1), & !relaxation coefficient
                                 dp0ij( kdm),   & !minimum layer thickness
                                 dp0cum(kdm+1)    !minimum interface depth
-      real,    intent(in)    ::    dp_i_j(kdm)   !   dp(i,j,:,n)
-      real,    intent(out)   ::     p_i_j(kdm+1) !    p(i,j,:)
+      real,    intent(out)   :: p_i_j(kdm+1)     !p(i,j,:), interface depths
 !
 ! --- --------------------------------------------------------------
 ! --- hybrid grid generator, single column(part A) - initialization.
+! --- depth_i_j is in m, everything else is in pressure units
 ! --- --------------------------------------------------------------
 !
-      real    hybrlx,q,qts
+      real    hybrlx,q,qts,dpns,dsns
       integer k,fixall
 !
       hybrlx = 1.0/qhybrlx
 !
+! --- dpns = sum(dp0k(k),k=1,nsigma)
+! --- dsns = sum(ds0k(k),k=1,nsigma)
 ! --- terrain following starts at depth dpns and ends at depth dsns
 ! --- and the depth of the k-th layer interface varies linearly with 
 ! --- total depth between these two reference depths.
-
+!
+      if     (nsigma.eq.0) then
+        dpns    = dp0k(1)
+        dsns    = 0.0
+      else
+        dpns = 0.0
+        dsns = 0.0
+        do k=1,nsigma
+          dpns = dpns + dp0k(k)
+          dsns = dsns + ds0k(k)
+        enddo !k
+      endif !nsigma
+      dpns = dpns*qonem  !depthsi_i_j is in m
+      dsns = dsns*qonem  !depthsi_i_j is in m
+!
       if     (dpns.eq.dsns) then
         qdep = 1.0  !not terrain following
       else
         qdep = max( 0.0, min( 1.0, &
-                              (depths(i,j) - dsns)/ &
-                              (dpns        - dsns)  ) )
+                              (depths_i_j - dsns)/ &
+                              (dpns       - dsns)  ) )
       endif
 !
       if     (qdep.lt.1.0) then
@@ -364,7 +400,7 @@
         dp0cum(2)=dp0cum(1)+dp0ij(1)
         qhrlx( 2)=1.0
         p_i_j( 2)=p_i_j(1)+dp_i_j(1)
-        do k=2,kk
+        do k=2,kdm
           qhrlx( k+1)=1.0
           dp0ij( k)  =qdep*dp0k(k) + (1.0-qdep)*ds0k(k)
           dp0cum(k+1)=dp0cum(k)+dp0ij(k)
@@ -391,7 +427,7 @@
         dp0cum(2)=dp0cum(1)+dp0ij(1)
         qhrlx( 2)=1.0 !no relaxation in top layer
         p_i_j( 2)=p_i_j(1)+dp_i_j(1)
-        do k=2,kk
+        do k=2,kdm
 ! ---     q is dp0k(k) when in surface fixed coordinates
 ! ---     q is dp00i   when much deeper than surface fixed coordinates
           if     (dp0k(k).le.dp00i) then
@@ -420,7 +456,7 @@
 ! --- identify the current fixed coordinate layers
       fixlay = 1  !layer 1 always fixed
       do k= 2,nhybrd
-        if     (dp0cum(k).ge.topiso(i,j)) then
+        if     (dp0cum(k).ge.topiso_i_j) then
           exit  !layers k to nhybrd might be isopycnal
         endif
 ! ---   top of layer is above topiso, i.e. always fixed coordinate layer
@@ -467,7 +503,7 @@
 !diag        (k,dp_i_j(k)*qonem,   dp0ij(k)*qonem, &
 !diag            p_i_j(k+1)*qonem,dp0cum(k+1)*qonem, &
 !diag            1.0/qhrlx(k+1), &
-!diag         k=1,kk)
+!diag         k=1,kdm)
 !diag      endif !debug
       return
       end subroutine hybgenaij_init
@@ -942,26 +978,31 @@
       return
       end subroutine hybgenaij_unmix
 
-      subroutine hybgenaij_regrid(n,i,j, &
+      subroutine hybgenaij_regrid(i,j,kdm, &
+!diag                             itest,jtest,lp, &
+                                  nhybrd,&
+                                  thbase,thkbot, &
+                                  onemm,onem,tenm,qonem,epsil, &
                                   theta_i_j, &
                                   fixlay,qhrlx,dp0ij,dp0cum, &
                                   th3d_i_j, p_i_j, &
                                   pres)
-      use mod_xc         ! HYCOM communication interface
-      use mod_cb_arrays,&  ! HYCOM saved arrays
-       only : nhybrd, &  !number of hybrid levels (typically kdm)
-              itest, &   !grid point where detailed diagnostics are desired
-              jtest, &   !grid point where detailed diagnostics are desired
-              thbase, &  !reference density (sigma units)
-              thkbot, &  !thickness of bottom boundary layer (m)
-              onemm, &   !one mm in pressure units
-              onem,  &   !one m  in pressure units
-              tenm,  &   !ten m  in pressure units
-              qonem, &   !1.0/onem
-              epsil      !small nonzero to prevent division by zero
       implicit none
 !
-      integer n, i,j
+      integer, intent(in)    :: &
+                i,j, &          !grid point, for diagnostics
+!diag           itest,jtest, &  !printout this point
+!diag           lp, &           !output unit
+                kdm, &          !number of layers
+                nhybrd          !number of hybrid layers (typically kdm)
+      real,    intent(in)    :: &
+                thbase, &       !reference density (sigma units)
+                thkbot, &       !thickness of bottom boundary layer (m)
+                onemm, &        !one mm in pressure units
+                onem,  &        !one m  in pressure units
+                tenm,  &        !ten m  in pressure units
+                qonem, &        !1.0/onem
+                epsil           !small nonzero to prevent division by zero
       integer, intent(in)    :: fixlay           !deepest fixed coordinate layer
       real,    intent(in)    :: qhrlx( kdm+1), & !relaxation coefficient
                                 dp0ij( kdm),   & !minimum layer thickness
@@ -1006,7 +1047,7 @@
 ! --- store one-dimensional arrays of -p- for the 'old'
 ! --- vertical grid before attempting to restore isopycnic conditions
       pres(1)=p_i_j(1)
-      do k=1,kk
+      do k=1,kdm
         pres(k+1)=p_i_j(k+1)
       enddo !k
 !
@@ -1019,7 +1060,7 @@
         k=1
         p_hat=p_i_j(k)+dp0ij(k)
         p_i_j(k+1)=p_hat
-        do k=2,kk
+        do k=2,kdm
           if     (p_i_j(k+1).ge.p_hat) then
             exit  ! usually get here quickly
           endif
@@ -1033,7 +1074,7 @@
 !diag     write(cinfo,'(a9,i2.2,1x)') '  do 88 k=',k
 !diag     write(lp,'(i9,2i5,a,a)') nstep,itest+i0,jtest+j0, &
 !diag       cinfo,':     othkns    odpth    nthkns    ndpth'
-!diag     do ka=1,kk
+!diag     do ka=1,kdm
 !diag       if     (pres(ka+1).eq.p(itest,jtest,ka+1) .and. &
 !diag               pres(ka  ).eq.p(itest,jtest,ka  )      ) then
 !diag         write(lp,'(i9,8x,a,a,i3,f10.3,f9.3)') &
@@ -1058,11 +1099,11 @@
         if (k.le.fixlay) then
 !
 ! ---     maintain constant thickness, k <= fixlay
-          if     (k.lt.kk) then  !p.kk+1 not changed
-            p_i_j(k+1)=min(dp0cum(k+1),p_i_j(kk+1))
+          if     (k.lt.kdm) then  !p.kdm+1 not changed
+            p_i_j(k+1)=min(dp0cum(k+1),p_i_j(kdm+1))
             if     (k.eq.fixlay) then
 ! ---         enforce interface order (may not be necessary).
-              do ka= k+2,kk
+              do ka= k+2,kdm
                 if     (p_i_j(ka).ge.p_i_j(k+1)) then
                   exit  ! usually get here quickly
                 else
@@ -1070,7 +1111,7 @@
                 endif
               enddo !ka
             endif !k.eq.fixlay
-          endif !k.lt.kk
+          endif !k.lt.kdm
 !
 !diag     if (i.eq.itest .and. j.eq.jtest) then
 !diag       write(lp,'(a,i3.2,f8.2)') 'hybgen, fixlay :', &
@@ -1116,7 +1157,7 @@
                   p_hat =p_i_j(k-1)+cushn(p_hat0-p_i_j(k-1),dp0ij(k-1))
                 endif !fixlay+2:else
               end if
-              p_hat=min(p_hat,p_i_j(kk+1))
+              p_hat=min(p_hat,p_i_j(kdm+1))
 !
 ! ---         if isopycnic conditions cannot be achieved because of a blocking
 ! ---         layer in the interior ocean, move interface k-1 (and k-2 if
@@ -1126,8 +1167,8 @@
 ! ---           do nothing.
               else if (p_hat.ge.p_i_j(k) .and. &
                        p_i_j(k-1).gt.dp0cum(k-1)+tenm .and. &
-                      (p_i_j(kk+1)-p_i_j(k-1).lt.thkbop .or. &
-                       p_i_j(k-1) -p_i_j(k-2).gt.qqmx*dp0ij(k-2))) then ! k.gt.2
+                      (p_i_j(kdm+1)-p_i_j(k-1).lt.thkbop .or. &
+                       p_i_j(k-1)  -p_i_j(k-2).gt.qqmx*dp0ij(k-2))) then ! k.gt.2
                 if     (k.eq.fixlay+3) then
 ! ---             treat layer k-2 as fixed.
                   p_hat2=p_i_j(k-2)+ &
@@ -1152,8 +1193,8 @@
                 elseif (k.le.fixlay+3) then
 ! ---             do nothing.
                 elseif (p_i_j(k-2).gt.dp0cum(k-2)+tenm .and. &
-                       (p_i_j(kk+1)-p_i_j(k-2).lt.thkbop .or. &
-                        p_i_j(k-2) -p_i_j(k-3).gt.qqmx*dp0ij(k-3))) then
+                       (p_i_j(kdm+1)-p_i_j(k-2).lt.thkbop .or. &
+                        p_i_j(k-2)  -p_i_j(k-3).gt.qqmx*dp0ij(k-3))) then
                   if     (k.eq.fixlay+4) then
 ! ---               treat layer k-3 as fixed.
                     p_hat3=p_i_j(k-3)+  max(p_i_j(k-2)-p_hat+ &
@@ -1213,7 +1254,7 @@
 ! ---       try to dilute with water from layer k+1
 ! ---       do not entrain if layer k touches bottom
 !
-            if (p_i_j(k+1).lt.p_i_j(kk+1)) then  ! k<kk
+            if (p_i_j(k+1).lt.p_i_j(kdm+1)) then  ! k<kdm
               if (th3d_i_j(k+1).le.theta_i_j(k+1) .or. &
                   p_i_j(k+1).le.dp0cum(k+1)+onem    .or. &
                   p_i_j(k+1)-p_i_j(k).lt.p_i_j(k+2)-p_i_j(k+1)) then
@@ -1243,8 +1284,8 @@
 ! ---           much as possible. otherwise, permit layers to collapse
 ! ---           to zero thickness at the bottom.  
 !
-                if     (p_i_j(min(k+3,kk+1)).lt.p_i_j(kk+1)) then
-                  if     (p_i_j(kk+1)-p_i_j(k).gt. &
+                if     (p_i_j(min(k+3,kdm+1)).lt.p_i_j(kdm+1)) then
+                  if     (p_i_j(kdm+1)-p_i_j(k).gt. &
                           dp0ij(k)+dp0ij(k+1)     ) then
                     p_hat=p_i_j(k+2)-cushn(p_i_j(k+2)-p_hat,dp0ij(k+1))
                   endif
@@ -1254,7 +1295,7 @@
                                      p_i_j(k+2)-dp0ij(k+1)))
                 else
                   p_hat=min(p_i_j(k+2),p_hat)
-                endif !p.k+2<p.kk+1
+                endif !p.k+2<p.kdm+1
                 if (p_hat.gt.p_i_j(k+1)) then
 ! ---             entrain layer k+1 water into layer k.
                   p_i_j(k+1)=(1.0-qhrlx(k+1))*p_i_j(k+1) + &
@@ -1272,7 +1313,7 @@
           endif !too dense or too light
 !
 ! ---     if layer above is still too thin, move interface down.
-          p_hat0=min(p_i_j(k-1)+dp0ij(k-1),p_i_j(kk+1))
+          p_hat0=min(p_i_j(k-1)+dp0ij(k-1),p_i_j(kdm+1))
           if (p_hat0.gt.p_i_j(k)) then
             p_hat =(1.0-qhrlx(k-1))*p_i_j(k)+ &
                         qhrlx(k-1) *p_hat0
