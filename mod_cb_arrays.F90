@@ -731,8 +731,10 @@
 ! --- 'mixfrq' = KT: number of time steps between diapycnal mixing calcs
 ! --- 'icefrq' = relax to tfrz with e-folding time of icefrq time steps
 ! --- 'icpfrq' = number of time steps between sea-ice updates
-! --- 'ntracr' = number of tracers (<=mxtrcr)
+! --- 'ntracr' = number of            tracers (<=mxtrcr)
+! --- 'mtracr' = number of diagnostic tracers (<=mxtrcr-ntracr)
 ! --- 'trcflg' = tracer type flag (one per tracer)
+! --- 'itracr' = index to model diagnostic tracers (trcflg 801 to 899)
 ! --- 'clmflg' = climatology frequency flag (6=bimonthly,12=monthly)
 ! --- 'dypflg' = KT: diapycnal mixing flag (0=none,1=KPP,2=explicit)
 ! --- 'iniflg' = initial state flag (0=level,1=zonal,2=climatology)
@@ -789,7 +791,7 @@
                      tsofrq,mixfrq,icefrq,icpfrq,nhybrd,nsigma, &
                      hybmap,hybflg,advflg,advtyp,momtyp,stfflg, &
                      kapref,kapnum, &
-                     ntracr,trcflg(mxtrcr), &
+                     ntracr,mtracr,trcflg(mxtrcr),itracr(801:899), &
                      clmflg,dypflg,iniflg,lbflag,mapflg,yrflag,sshflg, &
                      iversn,iexpt,jerlv0, &
                      iceflg,ishelf,icmflg,wndflg,amoflg,ustflg, &
@@ -973,11 +975,11 @@
                thstar = r_init
                 montg = r_init
 !
-      if     (ntracr.gt.0) then
+      if     (ntracr+mtracr.gt.0) then
 #if defined(RELO)
         allocate( &
-              tracer(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy,kdm,2,ntracr) )
-        call mem_stat_add( (idm+2*nbdy)*(jdm+2*nbdy)*kdm*2*ntracr )
+              tracer(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy,kdm,2,ntracr+mtracr) )
+        call mem_stat_add( (idm+2*nbdy)*(jdm+2*nbdy)*kdm*2*ntracr+mtracr )
 #endif
               tracer = r_init
       endif
@@ -1873,3 +1875,4 @@
 !> Oct. 2019 - added lbmont
 !> Oct. 2019 - added rmunvu and rmunvv, and layer 1 nested velocity ranges
 !> Nov. 2019 - added amoflg
+!> May  2022 - added mtracr and itracr
