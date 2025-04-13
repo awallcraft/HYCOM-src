@@ -212,26 +212,34 @@
           endif !ip
           if (SEA_U) then
             ubaro_m(i,j) = ubaro_m(i,j) + s*ubavg(i,j,n)
-! ---       depthu is either pbot(i,j) or pbot(i-1,j)
-            if     (pbot(i,j).eq.pbot(i-1,j)) then
+            if     (abs(shaved).eq.2) then
               oneta_u(i,j) = 0.5*(oneta(i,j,n)+oneta(i-1,j,n))
-            elseif (pbot(i,j).eq.depthu(i,j)) then
-              oneta_u(i,j) =      oneta(i,j,n)
             else
-              oneta_u(i,j) =                   oneta(i-1,j,n)
-            endif
+! ---         depthu is either pbot(i,j) or pbot(i-1,j)
+              if     (pbot(i,j).eq.pbot(i-1,j)) then
+                oneta_u(i,j) = 0.5*(oneta(i,j,n)+oneta(i-1,j,n))
+              elseif (pbot(i,j).eq.depthu(i,j)) then
+                oneta_u(i,j) =      oneta(i,j,n)
+              else
+                oneta_u(i,j) =                   oneta(i-1,j,n)
+              endif  
+            endif !shaved:partial 
           endif !iu
           if (SEA_V) then
             vbaro_m(i,j) = vbaro_m(i,j) + s*vbavg(i,j,n)
-! ---       depthv is either pbot(i,j) or pbot(i,j-1)
-            if     (pbot(i,j).eq.pbot(i,j-1)) then
+            if     (abs(shaved).eq.2) then
               oneta_v(i,j) = 0.5*(oneta(i,j,n)+oneta(i,j-1,n))
-            elseif (pbot(i,j).eq.depthv(i,j)) then
-              oneta_v(i,j) =      oneta(i,j,n)
             else
-              oneta_v(i,j) =                   oneta(i,j-1,n)
-            endif
-          endif !ip
+! ---         depthv is either pbot(i,j) or pbot(i,j-1)
+              if     (pbot(i,j).eq.pbot(i,j-1)) then
+                oneta_v(i,j) = 0.5*(oneta(i,j,n)+oneta(i,j-1,n))
+              elseif (pbot(i,j).eq.depthv(i,j)) then
+                oneta_v(i,j) =      oneta(i,j,n)
+              else
+                oneta_v(i,j) =                   oneta(i,j-1,n)
+              endif
+            endif !shaved:partial
+          endif !iv
         enddo !i
         do k= 1,kk
           do i=1,ii
@@ -863,5 +871,6 @@
 !> Dec  2018 - archive dp_m/oneta_m
 !> July 2023 - added a number 01-99 to tracer output
 !> July 2023 - added mtracr for diagnostic tracers
-!> Jan. 2025 - Added sshflg=3 for steric SSH and Montg. Potential
+!> Jan. 2025 - added sshflg=3 for steric SSH and Montg. Potential
 !> Feb. 2025 - printout now ok for kdm<1000 and idm,jdm<100,000
+!> Apr. 2025 - added shaved cell option

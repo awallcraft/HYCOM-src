@@ -3527,6 +3527,29 @@
             endif !1st tile
           endif !NPZ:NPZD
         enddo !ktr
+!
+#if defined(MOMTUM_CFL) || defined(MOMTUM4_CFL)
+!
+! ---   Only report new CFL maximums
+!
+        do k= 1,kk
+          if     (cflclp(k).gt.cflmax(k)) then
+            cflmax(k) = cflclp(k)  !save new maximum
+            if (mnproc.eq.1) then
+            write(lp, '(i9,a, &
+                         &'' L '',i3,'' maxspd,clip (m/s):'',2f10.4)') &
+                nstep,c_ydh, &
+                k,cflspd(k),cflclp(k)
+            call flush(lp)
+            write(nod,'(i9,a, &
+                         &'' L '',i3,'' maxspd,clip (m/s):'',2f10.4)') &
+                nstep,c_ydh, &
+                k,cflspd(k),cflclp(k)
+            call flush(nod)
+            endif !1st tile
+          endif !report
+        enddo !k
+#endif  /* CFL */
       endif  !diagno ...
 !
 ! --- diagnose meridional overturning and heat flux

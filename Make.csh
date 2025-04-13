@@ -70,13 +70,13 @@ endif
 
 # CPP flags for compilations
 # Equation Of State
-setenv OCN_SIG  -DEOS_SIG2 ## Sigma-2
-#setenv OCN_SIG -DEOS_SIG0 ## Sigma-0
+#setenv OCN_SIG  -DEOS_SIG2 ## Sigma-2
+setenv OCN_SIG -DEOS_SIG0 ## Sigma-0
 
-#setenv OCN_EOS -DEOS_7T  ## EOS  7-term
+setenv OCN_EOS -DEOS_7T  ## EOS  7-term
 #setenv OCN_EOS -DEOS_9T  ## EOS  9-term
 #setenv OCN_EOS -DEOS_12T ## EOS 12-term
-setenv OCN_EOS -DEOS_17T ## EOS 17-term
+#setenv OCN_EOS -DEOS_17T ## EOS 17-term
 
 # Optional CPP flags
 # Global or regional
@@ -96,8 +96,8 @@ setenv OCN_KAPP ""
 # -DLATBDT_NPLINE3 : update pline every 3 time steps
 # -DMASSLESS_1MM   : lowest substantial mass-containing layer > 1mm thick
 #setenv OCN_MISC ""
-#setenv OCN_MISC "-DMASSLESS_1MM -DRDNEST_MASK -DLATBDT_NPLINE3"
-setenv OCN_MISC "-DMASSLESS_1MM"
+#setenv OCN_MISC "-DMASSLESS_1MM"
+setenv OCN_MISC "-DMASSLESS_1MM -DMOMTUM_CFL -DRDNEST_MASK -DLATBDT_NPLINE3"
 
 # CPP_EXTRAS
 setenv CPP_EXTRAS "${OCN_SIG} ${OCN_EOS} ${OCN_GLB} ${OCN_KAPP} ${OCN_MISC}"

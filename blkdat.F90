@@ -880,6 +880,9 @@
 ! --- 'advflg' = thermal  advection flag (0=T&S, 1=th&S,   2=th&T)
 ! --- 'advtyp' = scalar   advection type (0=PCM, 1=MPDATA, 2=FCT2, 4=FCT4)
 ! --- 'momtyp' = momentum advection type (2=2nd; 3=S.QUICK; 4=M.S.QUICK)
+! --- 'shaved' = shaved cell flag (-1,1=partial,-2,2=shaved;-ve=no-sidewall)
+! ---             (use 'shaved'= 1 to recover original partial cells and
+! ---              use 'shaved'=-2 for standard shaved cells)
 ! --- 'slip'   = +1 free-slip, +1<slip<-1 partial, -1 no-slip boundary conditions
 ! --- 'visco2' = deformation-dependent Laplacian  viscosity factor
 ! --- 'visco4' = deformation-dependent biharmonic viscosity factor
@@ -920,6 +923,7 @@
       call blkini(advflg,'advflg')
       call blkini(advtyp,'advtyp')
       call blkini(momtyp,'momtyp')
+      call blkini(shaved,'shaved')
       call blkinr(slip,  'slip  ', &
            &'(a6," =",f10.4," (-1=no-slip, -1>:>+1=partial, +1=free)")')
       call blkinr(visco2,'visco2','(a6," =",f10.4," ")')
@@ -3091,3 +3095,4 @@
 !> Feb. 2025 - Negative cbar to input tidal amplitude flow speed
 !> Feb. 2025 - printout now ok for kdm<1000 and idm,jdm<100,000
 !> Mar. 2025 - isopyc identifies MICOM mode, .not.hybrid possible without isopyc
+!> Apr. 2025 - added shaved

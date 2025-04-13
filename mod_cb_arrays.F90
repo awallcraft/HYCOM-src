@@ -183,6 +183,7 @@
        pgfx, pgfy,     & ! horiz. presssure gradient
        gradx,grady,    & ! horiz. presssure gradient
        depthu,depthv,  & ! bottom pres. at u,v points
+       dpthup,dpthvp,  & ! bottom pres. at u,v points, partial cells
        pvtrop,         & ! pot.vort. of barotropic flow
        depths,         & ! water depth
        drag,           & ! bottom drag
@@ -277,7 +278,7 @@
        umix,  vmix       ! mixed layer velocity
 
 #if defined(RELO)
-      real, save, allocatable, dimension(:) ::  &
+      real, save, allocatable, dimension(:) ::  &  !allocated in blkdat
 #else
       real, save, dimension(kdm) ::  &
 #endif
@@ -654,6 +655,15 @@
                       lc0,lc1,lc2,lc3,  & ! clim. indexes
                       ln0,ln1,          & ! nest  indexes
                       lb0,lb1             ! baro. indexes
+!     
+#if defined(RELO)
+      real, save, allocatable, dimension(:) ::  &
+#else
+      real, save, dimension(kdm) ::  &
+#endif
+        cflmax, & ! per layer maximum reported speed
+        cflspd, & ! per layer maximum observed speed
+        cflclp    ! per layer maximum clipped  speed
 !
 ! --- 'sigma ' = isopyncnal layer target densities (sigma units)
 ! --- 'thbase' = reference density (sigma units)
@@ -788,10 +798,15 @@
 ! --- 'sstflg' = SST relaxation  flag (0=none,1=clim,2=atmos,3=obs)
 ! --- 'icmflg' = ice mask        flag (0=none,1=clim,2=atmos,3=obs)
 ! --- 'difsmo' = KPROF: number of layers with horiz smooth diff coeffs
+! --- 'shaved' = shaved cell flag (-1,1=partial,-2,2=shaved;-ve=no-sidewall)
 ! --- 'epmass' = E-P mass exchange flag (0=no,1=yes,2=river)
 !
+! --- cflmax = per layer maximum reported speed
+! --- cflspd = per layer maximum observed speed
+! --- cflclp = per layer maximum clipped  speed
+!
 #if defined(RELO)
-      real, save, allocatable, dimension(:) ::  &
+      real, save, allocatable, dimension(:) ::  & !allocated in blkdat
 #else
       real, save, dimension(kdm) ::  &
 #endif
@@ -825,7 +840,7 @@
                      iversn,iexpt,jerlv0, &
                      iceflg,ishelf,icmflg,wndflg,amoflg,ustflg, &
                      flxflg,empflg,dswflg,albflg,lwflag,sstflg,sssflg, &
-                     epmass,empbal,sssbal, &
+                     shaved,epmass,empbal,sssbal, &
                      difsmo,disp_count
 !
       real,    parameter :: &
@@ -974,6 +989,17 @@
 ! --- Allocate saved arrays
 !
       call set_r_init
+!     
+#if defined(RELO)    
+      allocate( &    
+                cflmax(kdm), &
+                cflspd(kdm), &
+                cflclp(kdm) )
+      call mem_stat_add( 3*kdm )
+#endif               
+                cflmax(:) = 0.0
+                cflspd(:) = 0.0
+                cflclp(:) = 0.0
 !
 #if defined(RELO)
       call gindex_allocate   !from mod_dimensions
@@ -1236,6 +1262,8 @@
                grady(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy), &
               depthu(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy), &
               depthv(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy), &
+              dpthup(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy), &
+              dpthvp(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy), &
               pvtrop(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy), &
               depths(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy), &
                 drag(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy), &
@@ -1246,7 +1274,7 @@
               diwqh0(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy), &
               sssrmx(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy), &
               drgfrh(1-nbdy:idm+nbdy,1-nbdy:jdm+nbdy) )
-      call mem_stat_add( 59*(idm+2*nbdy)*(jdm+2*nbdy) )
+      call mem_stat_add( 61*(idm+2*nbdy)*(jdm+2*nbdy) )
 #endif
                util1(:,:) = r_init
                util2(:,:) = r_init
@@ -1297,6 +1325,8 @@
                grady(:,:) = r_init
               depthu(:,:) = r_init
               depthv(:,:) = r_init
+              dpthup(:,:) = r_init
+              dpthvp(:,:) = r_init
               pvtrop(:,:) = r_init
               depths(:,:) = r_init
                 drag(:,:) = r_init
@@ -1925,3 +1955,6 @@
 !> Jan. 2025 - converted displd_mn and dispqd_mn to surface tracers
 !> Jan. 2025 - removed tidepg_mn
 !> Jan. 2025 - moved salfac to mod_tides
+!> Apr. 2025 - added shaved cell options
+!> Apr. 2025 - added dpthup,dpthvp
+!> Apr. 2025 - added cflmax, cflspd and cflclp
