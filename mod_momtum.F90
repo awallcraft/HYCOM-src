@@ -3045,8 +3045,9 @@
 !$OMP          SCHEDULE(STATIC,jblk)
       do j=1-margin,jj+margin
         do i=1-margin,ii+margin
-! ---     limit is conservative, so clipping occurs before CFL is exceedd
-          cfl = 0.707*0.5*min(scpx(i,j),scpy(i,j))/delt1
+! ---     assume u and v velocities are equal, i.e. an over-estimate
+! ---     delt1 is typically 2*baclin, 0.75 is a fudge factor
+          cfl = 0.75*(scpx(i,j)*scpy(i,j))/(delt1*(scpx(i,j)+scpy(i,j)))
           if (SEA_U) then
             k=1
               u(i,j,k,m) = u(i,j,k,m)/max(dpu(i,j,k,m),dpthin)
@@ -5598,8 +5599,9 @@
 !$OMP          SCHEDULE(STATIC,jblk)
       do j=1-margin,jj+margin
         do i=1-margin,ii+margin
-! ---     limit is conservative, so clipping occurs before CFL is exceedd
-          cfl = 0.707*0.5*min(scpx(i,j),scpy(i,j))/delt1
+! ---     assume u and v velocities are equal, i.e. an over-estimate
+! ---     delt1 is typically 2*baclin, 0.75 is a fudge factor
+          cfl = 0.75*(scpx(i,j)*scpy(i,j))/(delt1*(scpx(i,j)+scpy(i,j)))
           if (SEA_U) then
             k=1
               u(i,j,k,m) = u(i,j,k,m)/max(dpu(i,j,k,m),dpthin)
@@ -5866,3 +5868,4 @@
 !> Feb. 2025 - printout now ok for kdm<1000 and idm,jdm<100,000
 !> Apr. 2025 - added shaved, and shaved < 0 for no partial cell sidewalls
 !> Apr. 2025 - better diagnostics for momtum_cfl and momtum4_cfl
+!> Apr. 2025 - new calculation of advective cfl limit
